@@ -1,3 +1,5 @@
+This repository is for historical purposes only, please use https://github.com/MISP/PyMISP instead.
+
 README
 ======
 
