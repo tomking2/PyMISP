@@ -372,6 +372,21 @@ class MISPEvent(AbstractMISP):
         return self._types
 
     @property
+    def org(self):
+        return self.Org
+
+    @property
+    def orgc(self):
+        return self.Orgc
+
+    @orgc.setter
+    def orgc(self, orgc):
+        if isinstance(orgc, MISPOrganisation):
+            self.Orgc = orgc
+        else:
+            raise PyMISPError('Orgc must be of type MISPOrganisation.')
+
+    @property
     def attributes(self):
         return self.Attribute
 
@@ -516,6 +531,12 @@ class MISPEvent(AbstractMISP):
         if kwargs.get('Object'):
             for obj in kwargs.pop('Object'):
                 self.add_object(obj)
+        if kwargs.get('Org'):
+            self.Org = MISPOrganisation()
+            self.Org.from_dict(**kwargs.pop('Org'))
+        if kwargs.get('Orgc'):
+            self.Orgc = MISPOrganisation()
+            self.Orgc.from_dict(**kwargs.pop('Orgc'))
 
         super(MISPEvent, self).from_dict(**kwargs)
 
@@ -653,6 +674,7 @@ class MISPEvent(AbstractMISP):
             raise InvalidMISPObject("An object to add to an existing Event needs to be either a MISPObject, or a plain python dictionary")
         self.Object.append(misp_obj)
         self.edited = True
+        return misp_obj
 
     def __repr__(self):
         if hasattr(self, 'info'):
