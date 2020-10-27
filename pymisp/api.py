@@ -281,16 +281,20 @@ class PyMISP:
     def get_event(self, event: Union[MISPEvent, int, str, UUID],
                   deleted: Union[bool, int, list] = False,
                   extended: Union[bool, int] = False,
+                  includeRelatedTags: bool = False,
                   pythonify: bool = False) -> Union[Dict, MISPEvent]:
         """Get an event from a MISP instance
 
         :param event: event to get
         :param deleted: whether to include deleted events
         :param extended: whether to get extended events
+        :param includeRelatedTags: whether to get more relational information
         :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
         """
         event_id = get_uuid_or_id_from_abstract_misp(event)
         data = {}
+        if includeRelatedTags:
+            data['includeRelatedTags'] = includeRelatedTags
         if deleted:
             data['deleted'] = deleted
         if extended:
