@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from typing import TypeVar, Optional, Tuple, List, Dict, Union, Any, Mapping, Iterator
+from typing import TypeVar, Optional, Tuple, List, Dict, Union, Any, Mapping, Iterable
 from datetime import date, datetime
 import csv
 from pathlib import Path
@@ -15,6 +15,7 @@ from uuid import UUID
 import warnings
 import sys
 import copy
+from io import BytesIO, StringIO
 
 from . import __version__, everything_broken
 from .exceptions import MISPServerError, PyMISPUnexpectedResponse, PyMISPError, NoURL, NoKey
@@ -59,9 +60,10 @@ def get_uuid_or_id_from_abstract_misp(obj: Union[AbstractMISP, int, str, UUID]) 
     if isinstance(obj, MISPOrganisationBlocklist):
         return obj.org_uuid
 
-    if 'uuid' in obj:
-        return obj['uuid']
-    return obj['id']
+    # at this point, we must have an AbstractMISP
+    if 'uuid' in obj:  # type: ignore
+        return obj['uuid']  # type: ignore
+    return obj['id']  # type: ignore
 
 
 def register_user(misp_url: str, email: str,
@@ -114,6 +116,7 @@ class PyMISP:
         self.auth: Optional[AuthBase] = auth
         self.tool: str = tool
         self.timeout: Optional[Union[float, Tuple[float, float]]] = timeout
+        self.__session = requests.Session()  # use one session to keep connection between requests
 
         self.global_pythonify = False
 
@@ -310,13 +313,23 @@ class PyMISP:
         e.load(event_r)
         return e
 
-    def add_event(self, event: MISPEvent, pythonify: bool = False) -> Union[Dict, MISPEvent]:
+    def event_exists(self, event: Union[MISPEvent, int, str, UUID]) -> bool:
+        """Fast check if event exists.
+
+        :param event: Event to check
+        """
+        event_id = get_uuid_or_id_from_abstract_misp(event)
+        r = self._prepare_request('HEAD', f'events/view/{event_id}')
+        return self._check_head_response(r)
+
+    def add_event(self, event: MISPEvent, pythonify: bool = False, metadata: bool = False) -> Union[Dict, MISPEvent]:
         """Add a new event on a MISP instance
 
         :param event: event to add
         :param pythonify: Returns a PyMISP Object instead of the plain json output
+        :param metadata: Return just event metadata after successful creating
         """
-        r = self._prepare_request('POST', 'events/add', data=event)
+        r = self._prepare_request('POST', 'events/add' + ('/metadata:1' if metadata else ''), data=event)
         new_event = self._check_json_response(r)
         if not (self.global_pythonify or pythonify) or 'errors' in new_event:
             return new_event
@@ -324,18 +337,20 @@ class PyMISP:
         e.load(new_event)
         return e
 
-    def update_event(self, event: MISPEvent, event_id: Optional[int] = None, pythonify: bool = False) -> Union[Dict, MISPEvent]:
+    def update_event(self, event: MISPEvent, event_id: Optional[int] = None, pythonify: bool = False,
+                     metadata: bool = False) -> Union[Dict, MISPEvent]:
         """Update an event on a MISP instance'''
 
         :param event: event to update
         :param event_id: ID of event to update
         :param pythonify: Returns a PyMISP Object instead of the plain json output
+        :param metadata: Return just event metadata after successful update
         """
         if event_id is None:
             eid = get_uuid_or_id_from_abstract_misp(event)
         else:
             eid = get_uuid_or_id_from_abstract_misp(event_id)
-        r = self._prepare_request('POST', f'events/edit/{eid}', data=event)
+        r = self._prepare_request('POST', f'events/edit/{eid}' + ('/metadata:1' if metadata else ''), data=event)
         updated_event = self._check_json_response(r)
         if not (self.global_pythonify or pythonify) or 'errors' in updated_event:
             return updated_event
@@ -394,6 +409,15 @@ class PyMISP:
         o = MISPObject(misp_object_r['Object']['name'], standalone=False)
         o.from_dict(**misp_object_r)
         return o
+
+    def object_exists(self, misp_object: Union[MISPObject, int, str, UUID]) -> bool:
+        """Fast check if object exists.
+
+        :param misp_object: Attribute to check
+        """
+        object_id = get_uuid_or_id_from_abstract_misp(misp_object)
+        r = self._prepare_request('HEAD', f'objects/view/{object_id}')
+        return self._check_head_response(r)
 
     def add_object(self, event: Union[MISPEvent, int, str, UUID], misp_object: MISPObject, pythonify: bool = False) -> Union[Dict, MISPObject]:
         """Add a MISP Object to an existing MISP event
@@ -535,12 +559,22 @@ class PyMISP:
         a.from_dict(**attribute_r)
         return a
 
-    def add_attribute(self, event: Union[MISPEvent, int, str, UUID], attribute: MISPAttribute, pythonify: bool = False) -> Union[Dict, MISPAttribute, MISPShadowAttribute]:
+    def attribute_exists(self, attribute: Union[MISPAttribute, int, str, UUID]) -> bool:
+        """Fast check if attribute exists.
+
+        :param attribute: Attribute to check
+        """
+        attribute_id = get_uuid_or_id_from_abstract_misp(attribute)
+        r = self._prepare_request('HEAD', f'attributes/view/{attribute_id}')
+        return self._check_head_response(r)
+
+    def add_attribute(self, event: Union[MISPEvent, int, str, UUID], attribute: Union[MISPAttribute, Iterable], pythonify: bool = False) -> Union[Dict, MISPAttribute, MISPShadowAttribute]:
         """Add an attribute to an existing MISP event
 
         :param event: event to extend
-        :param attribute: attribute to add.  NOTE MISP 2.4.113+: you can pass a list of attributes.
-            In that case, the pythonified response is the following: {'attributes': [MISPAttribute], 'errors': {errors by attributes}}
+        :param attribute: attribute or (MISP version 2.4.113+) list of attributes to add.
+            If a list is passed, the pythonified response is a dict with the following structure:
+            {'attributes': [MISPAttribute], 'errors': {errors by attributes}}
         :param pythonify: Returns a PyMISP Object instead of the plain json output
         """
         event_id = get_uuid_or_id_from_abstract_misp(event)
@@ -550,21 +584,29 @@ class PyMISP:
             # Multiple attributes were passed at once, the handling is totally different
             if not (self.global_pythonify or pythonify):
                 return new_attribute
-            to_return = {'attributes': []}
+            to_return: Dict[str, List[MISPAttribute]] = {'attributes': []}
             if 'errors' in new_attribute:
                 to_return['errors'] = new_attribute['errors']
 
-            for new_attr in new_attribute['Attribute']:
-                a = MISPAttribute()
-                a.from_dict(**new_attr)
-                to_return['attributes'].append(a)
+            if len(attribute) == 1:
+                # input list size 1 yields dict, not list of size 1
+                if 'Attribute' in new_attribute:
+                    a = MISPAttribute()
+                    a.from_dict(**new_attribute['Attribute'])
+                    to_return['attributes'].append(a)
+            else:
+                for new_attr in new_attribute['Attribute']:
+                    a = MISPAttribute()
+                    a.from_dict(**new_attr)
+                    to_return['attributes'].append(a)
             return to_return
 
         if ('errors' in new_attribute and new_attribute['errors'][0] == 403
                 and new_attribute['errors'][1]['message'] == 'You do not have permission to do that.'):
             # At this point, we assume the user tried to add an attribute on an event they don't own
             # Re-try with a proposal
-            return self.add_attribute_proposal(event_id, attribute, pythonify)
+            if isinstance(attribute, (MISPAttribute, dict)):
+                return self.add_attribute_proposal(event_id, attribute, pythonify)  # type: ignore
         if not (self.global_pythonify or pythonify) or 'errors' in new_attribute:
             return new_attribute
         a = MISPAttribute()
@@ -883,6 +925,24 @@ class PyMISP:
         response = self._prepare_request('POST', f'tags/delete/{tag_id}')
         return self._check_json_response(response)
 
+    def search_tags(self, tagname: str, strict_tagname: bool = False, pythonify: bool = False) -> Union[Dict, List[MISPTag]]:
+        """Search for tags by name.
+
+        :param tag_name: Name to search, use % for substrings matches.
+        :param strict_tagname: only return tags matching exactly the tag name (so skipping synonyms and cluster's value)
+        """
+        query = {'tagname': tagname, 'strict_tagname': strict_tagname}
+        response = self._prepare_request('POST', 'tags/search', data=query)
+        normalized_response = self._check_json_response(response)
+        if not (self.global_pythonify or pythonify) or 'errors' in normalized_response:
+            return normalized_response
+        to_return: List[MISPTag] = []
+        for tag in normalized_response:
+            t = MISPTag()
+            t.from_dict(**tag)
+            to_return.append(t)
+        return to_return
+
     # ## END Tags ###
 
     # ## BEGIN Taxonomies ###
@@ -1040,7 +1100,7 @@ class PyMISP:
         warninglist_id = get_uuid_or_id_from_abstract_misp(warninglist)
         return self.toggle_warninglist(warninglist_id=warninglist_id, force_enable=False)
 
-    def values_in_warninglist(self, value: Iterator) -> Dict:
+    def values_in_warninglist(self, value: Iterable) -> Dict:
         """Check if IOC values are in warninglist
 
         :param value: iterator with values to check
@@ -2100,7 +2160,13 @@ class PyMISP:
 
         return normalized_response
 
-    def search_index(self, published: Optional[bool] = None, eventid: Optional[SearchType] = None,
+    def search_index(self,
+                     all: Optional[str] = None,
+                     attribute: Optional[str] = None,
+                     email: Optional[str] = None,
+                     published: Optional[bool] = None,
+                     hasproposal: Optional[bool] = None,
+                     eventid: Optional[SearchType] = None,
                      tags: Optional[SearchParameterTypes] = None,
                      date_from: Optional[Union[datetime, date, int, str, float, None]] = None,
                      date_to: Optional[Union[datetime, date, int, str, float, None]] = None,
@@ -2113,23 +2179,45 @@ class PyMISP:
                                          Tuple[Union[datetime, date, int, str, float, None],
                                                Union[datetime, date, int, str, float, None]]
                                                ]] = None,
+                     publish_timestamp: Optional[Union[Union[datetime, date, int, str, float, None],
+                                                 Tuple[Union[datetime, date, int, str, float, None],
+                                                       Union[datetime, date, int, str, float, None]]
+                                                       ]] = None,
                      sharinggroup: Optional[List[SearchType]] = None,
+                     minimal: Optional[bool] = None,
                      pythonify: Optional[bool] = None) -> Union[Dict, List[MISPEvent]]:
-        """Search only at the index level. Using ! in front of a value means NOT (default is OR)
+        """Search event metadata shown on the event index page. Using ! in front of a value
+        means NOT, except for parameters date_from, date_to and timestamp which cannot be negated.
+        Criteria are AND-ed together; values in lists are OR-ed together. Return matching events
+        with metadata but no attributes or objects; also see minimal parameter.
 
-        :param published: Set whether published or unpublished events should be returned. Do not set the parameter if you want both.
+        :param all: Search for a full or a substring (delimited by % for substrings) in the
+            event info, event tags, attribute tags, attribute values or attribute comment fields.
+        :param attribute: Filter on attribute's value.
+        :param email: Filter on user's email.
+        :param published: Set whether published or unpublished events should be returned.
+            Do not set the parameter if you want both.
+        :param hasproposal: Filter for events containing proposal(s).
         :param eventid: The events that should be included / excluded from the search
-        :param tags: Tags to search or to exclude. You can pass a list, or the output of `build_complex_query`
-        :param date_from: Events with the date set to a date after the one specified. This filter will use the date of the event.
-        :param date_to: Events with the date set to a date before the one specified. This filter will use the date of the event.
+        :param tags: Tags to search or to exclude. You can pass a list, or the output of
+            `build_complex_query`
+        :param date_from: Events with the date set to a date after the one specified.
+            This filter will use the date of the event.
+        :param date_to: Events with the date set to a date before the one specified.
+            This filter will use the date of the event.
         :param eventinfo: Filter on the event's info field.
         :param threatlevel: Threat level(s) (1,2,3,4) | list
         :param distribution: Distribution level(s) (0,1,2,3) | list
         :param analysis: Analysis level(s) (0,1,2) | list
         :param org: Search by the creator organisation by supplying the organisation identifier.
-        :param timestamp: Restrict the results by the timestamp (last edit). Any event with a timestamp newer than the given timestamp will be returned. In case you are dealing with /attributes as scope, the attribute's timestamp will be used for the lookup.
+        :param timestamp: Restrict the results by the timestamp (last edit). Any event with a
+            timestamp newer than the given timestamp will be returned. In case you are dealing
+            with /attributes as scope, the attribute's timestamp will be used for the lookup.
+        :param publish_timestamp: Filter on event's publish timestamp.
         :param sharinggroup: Restrict by a sharing group | list
-        :param pythonify: Returns a list of PyMISP Objects instead or the plain json output. Warning: it might use a lot of RAM
+        :param minimal: Return only event ID, UUID, timestamp, sighting_timestamp and published.
+        :param pythonify: Returns a list of PyMISP Objects instead of the plain json output.
+            Warning: it might use a lot of RAM
         """
         query = locals()
         query.pop('self')
@@ -2275,7 +2363,7 @@ class PyMISP:
         :param org: Organisation of the User doing the action
         :param description: Description of the action
         :param ip: Origination IP of the User doing the action
-        :param pythonify: Returns a list of PyMISP Objects instead or the plain json output. Warning: it might use a lot of RAM
+        :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
         '''
         query = locals()
         query.pop('self')
@@ -2506,20 +2594,27 @@ class PyMISP:
             to_return.append(a)
         return to_return
 
-    def upload_stix(self, path, version: str = '2'):
+    def upload_stix(self, path: Optional[Union[str, Path, BytesIO, StringIO]] = None, data: Optional[Union[str, bytes]] = None, version: str = '2'):
         """Upload a STIX file to MISP.
 
         :param path: Path to the STIX on the disk (can be a path-like object, or a pseudofile)
+        :param data: stix object
         :param version: Can be 1 or 2
         """
-        if isinstance(path, (str, Path)):
-            with open(path, 'rb') as f:
-                to_post = f.read()
+        to_post: Union[str, bytes]
+        if path is not None:
+            if isinstance(path, (str, Path)):
+                with open(path, 'rb') as f:
+                    to_post = f.read()
+            else:
+                to_post = path.read()
+        elif data is not None:
+            to_post = data
         else:
-            to_post = path.read()
+            raise MISPServerError("please fill path or data parameter")
 
         if isinstance(to_post, bytes):
-            to_post = to_post.decode()  # type: ignore
+            to_post = to_post.decode()
 
         if str(version) == '1':
             url = urljoin(self.root_url, '/events/upload_stix')
@@ -2862,11 +2957,20 @@ class PyMISP:
         '''Build a complex search query. MISP expects a dictionary with AND, OR and NOT keys.'''
         to_return = {}
         if and_parameters:
-            to_return['AND'] = [p for p in and_parameters if p]
+            if isinstance(and_parameters, str):
+                to_return['AND'] = [and_parameters]
+            else:
+                to_return['AND'] = [p for p in and_parameters if p]
         if not_parameters:
-            to_return['NOT'] = [p for p in not_parameters if p]
+            if isinstance(not_parameters, str):
+                to_return['NOT'] = [not_parameters]
+            else:
+                to_return['NOT'] = [p for p in not_parameters if p]
         if or_parameters:
-            to_return['OR'] = [p for p in or_parameters if p]
+            if isinstance(or_parameters, str):
+                to_return['OR'] = [or_parameters]
+            else:
+                to_return['OR'] = [p for p in or_parameters if p]
         return to_return
 
     # ## END Global helpers ###
@@ -2948,6 +3052,14 @@ class PyMISP:
             return r
         # Else: an exception was raised anyway
 
+    def _check_head_response(self, response: requests.Response) -> bool:
+        if response.status_code == 200:
+            return True
+        elif response.status_code == 404:
+            return False
+        else:
+            raise MISPServerError(f'Error code {response.status_code} for HEAD request')
+
     def _check_response(self, response: requests.Response, lenient_response_type: bool = False, expect_json: bool = False) -> Union[Dict, str]:
         """Check if the response from the server is not an unexpected error"""
         if response.status_code >= 500:
@@ -2988,7 +3100,7 @@ class PyMISP:
     def __repr__(self):
         return f'<{self.__class__.__name__}(url={self.root_url})'
 
-    def _prepare_request(self, request_type: str, url: str, data: Union[str, Iterator, Mapping, AbstractMISP] = {}, params: Mapping = {},
+    def _prepare_request(self, request_type: str, url: str, data: Union[str, Iterable, Mapping, AbstractMISP] = {}, params: Mapping = {},
                          kw_params: Mapping = {}, output_type: str = 'json') -> requests.Response:
         '''Prepare a request for python-requests'''
         url = urljoin(self.root_url, url)
@@ -3009,21 +3121,22 @@ class PyMISP:
             # CakePHP params in URL
             to_append_url = '/'.join([f'{k}:{v}' for k, v in kw_params.items()])
             url = f'{url}/{to_append_url}'
+
         req = requests.Request(request_type, url, data=d, params=params)
-        with requests.Session() as s:
-            user_agent = f'PyMISP {__version__} - Python {".".join(str(x) for x in sys.version_info[:2])}'
-            if self.tool:
-                user_agent = f'{user_agent} - {self.tool}'
-            req.auth = self.auth
-            prepped = s.prepare_request(req)
-            prepped.headers.update(
-                {'Authorization': self.key,
-                 'Accept': f'application/{output_type}',
-                 'content-type': 'application/json',
-                 'User-Agent': user_agent})
-            logger.debug(prepped.headers)
-            settings = s.merge_environment_settings(req.url, proxies=self.proxies or {}, stream=None, verify=self.ssl, cert=self.cert)
-            return s.send(prepped, timeout=self.timeout, **settings)
+        user_agent = f'PyMISP {__version__} - Python {".".join(str(x) for x in sys.version_info[:2])}'
+        if self.tool:
+            user_agent = f'{user_agent} - {self.tool}'
+        req.auth = self.auth
+        prepped = self.__session.prepare_request(req)
+        prepped.headers.update(
+            {'Authorization': self.key,
+             'Accept': f'application/{output_type}',
+             'content-type': 'application/json',
+             'User-Agent': user_agent})
+        logger.debug(prepped.headers)
+        settings = self.__session.merge_environment_settings(req.url, proxies=self.proxies or {}, stream=None,
+                                                             verify=self.ssl, cert=self.cert)
+        return self.__session.send(prepped, timeout=self.timeout, **settings)
 
     def _csv_to_dict(self, csv_content: str) -> List[dict]:
         '''Makes a list of dict out of a csv file (requires headers)'''

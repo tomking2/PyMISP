@@ -6,7 +6,7 @@ import json
 import os
 import base64
 import sys
-from io import BytesIO, IOBase
+from io import BytesIO, BufferedIOBase, TextIOBase
 from zipfile import ZipFile
 import uuid
 from collections import defaultdict
@@ -84,6 +84,11 @@ def _make_datetime(value) -> datetime:
 
 
 def make_bool(value: Optional[Union[bool, int, str, dict, list]]) -> bool:
+    """Converts the supplied value to a boolean.
+
+    :param value: Value to interpret as a boolean.  An empty string, dict
+        or list is False; value None is also False.
+    """
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -148,13 +153,14 @@ class MISPSighting(AbstractMISP):
 
     def from_dict(self, **kwargs):
         """Initialize the MISPSighting from a dictionary
-        :value: Value of the attribute the sighting is related too. Pushing this object
-                will update the sighting count of each attriutes with thifs value on the instance
-        :uuid: UUID of the attribute to update
-        :id: ID of the attriute to update
-        :source: Source of the sighting
-        :type: Type of the sighting
-        :timestamp: Timestamp associated to the sighting
+
+        :param value: Value of the attribute the sighting is related too. Pushing this object
+            will update the sighting count of each attribute with this value on the instance.
+        :param uuid: UUID of the attribute to update
+        :param id: ID of the attriute to update
+        :param source: Source of the sighting
+        :param type: Type of the sighting
+        :param timestamp: Timestamp associated to the sighting
         """
         if 'Sighting' in kwargs:
             kwargs = kwargs['Sighting']
@@ -177,8 +183,9 @@ class MISPAttribute(AbstractMISP):
 
     def __init__(self, describe_types: Optional[Dict] = None, strict: bool = False):
         """Represents an Attribute
-            :describe_type: Use it is you want to overwrite the defualt describeTypes.json file (you don't)
-            :strict: If false, fallback to sane defaults for the attribute type if the ones passed by the user are incorrect
+
+        :param describe_types: Use it if you want to overwrite the default describeTypes.json file (you don't)
+        :param strict: If false, fallback to sane defaults for the attribute type if the ones passed by the user are incorrect
         """
         super().__init__()
         if describe_types:
@@ -200,12 +207,15 @@ class MISPAttribute(AbstractMISP):
         self.Event: MISPEvent
         self.RelatedAttribute: List[MISPAttribute]
 
+        # For malware sample
+        self._malware_binary: Optional[BytesIO]
+
     def add_tag(self, tag: Optional[Union[str, MISPTag, Dict]] = None, **kwargs) -> MISPTag:
         return super()._add_tag(tag, **kwargs)
 
     @property
     def tags(self) -> List[MISPTag]:
-        """Returns a lost of tags associated to this Attribute"""
+        """Returns a list of tags associated to this Attribute"""
         return self.Tag
 
     @tags.setter
@@ -239,8 +249,8 @@ class MISPAttribute(AbstractMISP):
                             with f.open(name, pwd=b'infected') as unpacked:
                                 self.malware_filename = unpacked.read().decode().strip()
                         else:
-                            with f.open(name, pwd=b'infected') as unpacked:
-                                self._malware_binary = BytesIO(unpacked.read())
+                            # decrypting a zipped file is extremely slow. We do it on-demand in self.malware_binary
+                            continue
             except Exception:
                 # not a encrypted zip file, assuming it is a new malware sample
                 self._prepare_new_malware_sample()
@@ -250,9 +260,9 @@ class MISPAttribute(AbstractMISP):
             _datetime = _make_datetime(value)
 
             if name == 'last_seen' and hasattr(self, 'first_seen') and self.first_seen > _datetime:
-                raise PyMISPError('last_seen ({value}) has to be after first_seen ({self.first_seen})')
+                raise PyMISPError(f'last_seen ({value}) has to be after first_seen ({self.first_seen})')
             if name == 'first_seen' and hasattr(self, 'last_seen') and self.last_seen < _datetime:
-                raise PyMISPError('first_seen ({value}) has to be before last_seen ({self.last_seen})')
+                raise PyMISPError(f'first_seen ({value}) has to be before last_seen ({self.last_seen})')
             super().__setattr__(name, _datetime)
         elif name == 'data':
             self._prepare_data(value)
@@ -260,7 +270,7 @@ class MISPAttribute(AbstractMISP):
             super().__setattr__(name, value)
 
     def hash_values(self, algorithm: str = 'sha512') -> List[str]:
-        """Compute the hash of every values for fast lookups"""
+        """Compute the hash of every value for fast lookups"""
         if algorithm not in hashlib.algorithms_available:
             raise PyMISPError('The algorithm {} is not available for hashing.'.format(algorithm))
         if '|' in self.type or self.type == 'malware-sample':
@@ -299,8 +309,23 @@ class MISPAttribute(AbstractMISP):
 
     @property
     def malware_binary(self) -> Optional[BytesIO]:
-        """Returns a BytesIO of the malware (if the attribute has one, obvs)."""
+        """Returns a BytesIO of the malware, if the attribute has one.
+        Decrypts, unpacks and caches the binary on the first invocation,
+        which may require some time for large attachments (~1s/MB).
+        """
+        if self.type != 'malware-sample':
+            # Not a malware sample
+            return None
         if hasattr(self, '_malware_binary'):
+            # Already unpacked
+            return self._malware_binary
+        elif hasattr(self, 'malware_filename'):
+            # Have a binary, but didn't decrypt it yet
+            with ZipFile(self.data) as f:  # type: ignore
+                for name in f.namelist():
+                    if not name.endswith('.filename.txt'):
+                        with f.open(name, pwd=b'infected') as unpacked:
+                            self._malware_binary = BytesIO(unpacked.read())
             return self._malware_binary
         return None
 
@@ -322,7 +347,7 @@ class MISPAttribute(AbstractMISP):
 
     @sightings.setter
     def sightings(self, sightings: List[MISPSighting]):
-        """Set a list of prepared MISPShadowAttribute."""
+        """Set a list of prepared MISPSighting."""
         if all(isinstance(x, MISPSighting) for x in sightings):
             self.Sighting = sightings
         else:
@@ -507,11 +532,7 @@ class MISPAttribute(AbstractMISP):
         else:
             # Assuming the user only passed the filename
             self.malware_filename = self.value
-        # m = hashlib.md5()
-        # m.update(self.data.getvalue())
         self.value = self.malware_filename
-        # md5 = m.hexdigest()
-        # self.value = '{}|{}'.format(self.malware_filename, md5)
         self._malware_binary = self.data
         self.encrypt = True
 
@@ -606,24 +627,29 @@ class MISPObject(AbstractMISP):
 
     def __init__(self, name: str, strict: bool = False, standalone: bool = True, default_attributes_parameters: Dict = {}, **kwargs):
         ''' Master class representing a generic MISP object
-        :name: Name of the object
 
-        :strict: Enforce validation with the object templates
-
-        :standalone: The object will be pushed as directly on MISP, not as a part of an event.
+        :param name: Name of the object
+        :param strict: Enforce validation with the object templates
+        :param standalone: The object will be pushed as directly on MISP, not as a part of an event.
             In this case the ObjectReference needs to be pushed manually and cannot be in the JSON dump.
-
-        :default_attributes_parameters: Used as template for the attributes if they are not overwritten in add_attribute
-
-        :misp_objects_path_custom: Path to custom object templates
+        :param default_attributes_parameters: Used as template for the attributes if they are not overwritten in add_attribute
+        :param misp_objects_path_custom: Path to custom object templates
+        :param misp_objects_template_custom: Template of the object. Expects the content (dict, loaded with json.load or json.loads) of a template definition file, see repository MISP/misp-objects.
         '''
         super().__init__(**kwargs)
         self._strict: bool = strict
         self.name: str = name
         self._known_template: bool = False
         self.id: int
+        self._definition: Optional[Dict]
 
-        self._set_template(kwargs.get('misp_objects_path_custom'))
+        misp_objects_template_custom = kwargs.pop('misp_objects_template_custom', None)
+        misp_objects_path_custom = kwargs.pop('misp_objects_path_custom', None)
+        if misp_objects_template_custom:
+            self._set_template(misp_objects_template_custom=misp_objects_template_custom)
+        else:
+            # Fall back to default path if None
+            self._set_template(misp_objects_path_custom=misp_objects_path_custom)
 
         self.uuid: str = str(uuid.uuid4())
         self.first_seen: datetime
@@ -661,14 +687,19 @@ class MISPObject(AbstractMISP):
         self.standalone = standalone
 
     def _load_template_path(self, template_path: Union[Path, str]) -> bool:
-        self._definition: Optional[Dict] = self._load_json(template_path)
-        if not self._definition:
+        template = self._load_json(template_path)
+        if not template:
+            self._definition = None
             return False
+        self._load_template(template)
+        return True
+
+    def _load_template(self, template: Dict) -> None:
+        self._definition = template
         setattr(self, 'meta-category', self._definition['meta-category'])
         self.template_uuid = self._definition['uuid']
         self.description = self._definition['description']
         self.template_version = self._definition['version']
-        return True
 
     def _set_default(self):
         if not hasattr(self, 'comment'):
@@ -697,16 +728,21 @@ class MISPObject(AbstractMISP):
             self.name = object_name
         self._set_template(misp_objects_path_custom)
 
-    def _set_template(self, misp_objects_path_custom: Optional[Union[Path, str]] = None):
-        if misp_objects_path_custom:
-            # If misp_objects_path_custom is given, and an object with the given name exists, use that.
-            if isinstance(misp_objects_path_custom, str):
-                self.misp_objects_path = Path(misp_objects_path_custom)
-            else:
-                self.misp_objects_path = misp_objects_path_custom
+    def _set_template(self, misp_objects_path_custom: Optional[Union[Path, str]] = None, misp_objects_template_custom: Optional[Dict] = None):
+        if misp_objects_template_custom:
+            # A complete template was given to the constructor
+            self._load_template(misp_objects_template_custom)
+            self._known_template = True
+        else:
+            if misp_objects_path_custom:
+                # If misp_objects_path_custom is given, and an object with the given name exists, use that.
+                if isinstance(misp_objects_path_custom, str):
+                    self.misp_objects_path = Path(misp_objects_path_custom)
+                else:
+                    self.misp_objects_path = misp_objects_path_custom
 
-        # Try to get the template
-        self._known_template = self._load_template_path(self.misp_objects_path / self.name / 'definition.json')
+            # Try to get the template
+            self._known_template = self._load_template_path(self.misp_objects_path / self.name / 'definition.json')
 
         if not self._known_template and self._strict:
             raise UnknownMISPObjectTemplate('{} is unknown in the MISP object directory.'.format(self.name))
@@ -771,6 +807,10 @@ class MISPObject(AbstractMISP):
                 else:
                     self._known_template = False
 
+        # depending on how the object is initialized, we may have a few keys to pop
+        kwargs.pop('misp_objects_template_custom', None)
+        kwargs.pop('misp_objects_path_custom', None)
+
         if 'distribution' in kwargs and kwargs['distribution'] is not None:
             self.distribution = kwargs.pop('distribution')
             self.distribution = int(self.distribution)
@@ -824,11 +864,15 @@ class MISPObject(AbstractMISP):
         super().from_dict(**kwargs)
 
     def add_reference(self, referenced_uuid: Union[AbstractMISP, str], relationship_type: str, comment: Optional[str] = None, **kwargs) -> MISPObjectReference:
-        """Add a link (uuid) to an other object"""
+        """Add a link (uuid) to another object"""
         if isinstance(referenced_uuid, AbstractMISP):
             # Allow to pass an object or an attribute instead of its UUID
             referenced_uuid = referenced_uuid.uuid
-        if kwargs.get('object_uuid'):
+        if 'object_uuid' in kwargs and not kwargs.get('object_uuid'):
+            # Unexplained None in object_uuid key -> https://github.com/MISP/PyMISP/issues/640
+            kwargs.pop('object_uuid')
+            object_uuid = self.uuid
+        elif kwargs.get('object_uuid'):
             # Load existing object
             object_uuid = kwargs.pop('object_uuid')
         else:
@@ -881,9 +925,7 @@ class MISPObject(AbstractMISP):
         else:
             attribute = MISPObjectAttribute({})
         # Overwrite the parameters of self._default_attributes_parameters with the ones of value
-        attribute.from_dict(object_relation=object_relation, **dict(self._default_attributes_parameters, **value))
-        # FIXME New syntax python3 only, keep for later.
-        # attribute.from_dict(object_relation=object_relation, **{**self._default_attributes_parameters, **value})
+        attribute.from_dict(object_relation=object_relation, **{**self._default_attributes_parameters, **value})
         self.__fast_attribute_access[object_relation].append(attribute)
         self.Attribute.append(attribute)
         self.edited = True
@@ -970,7 +1012,7 @@ class MISPEvent(AbstractMISP):
 
     @property
     def tags(self) -> List[MISPTag]:
-        """Returns a lost of tags associated to this Event"""
+        """Returns a list of tags associated to this Event"""
         return self.Tag
 
     @tags.setter
@@ -1031,7 +1073,8 @@ class MISPEvent(AbstractMISP):
 
     def to_feed(self, valid_distributions: List[int] = [0, 1, 2, 3, 4, 5], with_meta: bool = False) -> Dict:
         """ Generate a json output for MISP Feed.
-        Note: valid_distributions only makes sense if the distribution key is set; i.e., the event is exported from a MISP instance.
+
+        :param valid_distributions: only makes sense if the distribution key is set; i.e., the event is exported from a MISP instance.
         """
         required = ['info', 'Orgc']
         for r in required:
@@ -1141,9 +1184,9 @@ class MISPEvent(AbstractMISP):
 
     def load(self, json_event: Union[IO, str, bytes, dict], validate: bool = False, metadata_only: bool = False):
         """Load a JSON dump from a pseudo file or a JSON string"""
-        if isinstance(json_event, IOBase):
-            # python2 and python3 compatible to find if we have a file
-            json_event = json_event.read()
+        if isinstance(json_event, (BufferedIOBase, TextIOBase)):
+            json_event = json_event.read()  # type: ignore
+
         if isinstance(json_event, (str, bytes)):
             json_event = json.loads(json_event)
 
@@ -1182,7 +1225,11 @@ class MISPEvent(AbstractMISP):
         super().__setattr__(name, value)
 
     def set_date(self, d: Optional[Union[str, int, float, datetime, date]] = None, ignore_invalid: bool = False):
-        """Set a date for the event (string, datetime, or date object)"""
+        """Set a date for the event
+
+        :param d: String, datetime, or date object
+        :param ignore_invalid: if True, assigns current date if d is not an expected type
+        """
         if isinstance(d, (str, int, float, datetime, date)):
             self.date = d  # type: ignore
         elif ignore_invalid:
@@ -1297,7 +1344,8 @@ class MISPEvent(AbstractMISP):
 
     def get_attribute_tag(self, attribute_identifier: str) -> List[MISPTag]:
         """Return the tags associated to an attribute or an object attribute.
-           :attribute_identifier: can be an ID, UUID, or the value.
+
+        :param attribute_identifier: can be an ID, UUID, or the value.
         """
         tags: List[MISPTag] = []
         for a in self.attributes + [attribute for o in self.objects for attribute in o.attributes]:
@@ -1309,9 +1357,10 @@ class MISPEvent(AbstractMISP):
         return tags
 
     def add_attribute_tag(self, tag: Union[MISPTag, str], attribute_identifier: str) -> List[MISPAttribute]:
-        """Add a tag to an existing attribute, raise an Exception if the attribute doesn't exists.
-            :tag: Tag name as a string, MISPTag instance, or dictionary
-            :attribute_identifier: can be an ID, UUID, or the value.
+        """Add a tag to an existing attribute. Raise an Exception if the attribute doesn't exist.
+
+        :param tag: Tag name as a string, MISPTag instance, or dictionary
+        :param attribute_identifier: can be an ID, UUID, or the value.
         """
         attributes = []
         for a in self.attributes + [attribute for o in self.objects for attribute in o.attributes]:
@@ -1336,7 +1385,10 @@ class MISPEvent(AbstractMISP):
         self.published = False
 
     def delete_attribute(self, attribute_id: str):
-        """Delete an attribute, you can search by ID or UUID"""
+        """Delete an attribute
+
+        :param attribute_id: ID or UUID
+        """
         for a in self.attributes:
             if ((hasattr(a, 'id') and a.id == attribute_id)
                     or (hasattr(a, 'uuid') and a.uuid == attribute_id)):
@@ -1361,21 +1413,27 @@ class MISPEvent(AbstractMISP):
         return attribute
 
     def get_object_by_id(self, object_id: Union[str, int]) -> MISPObject:
-        """Get an object by ID (the ID is the one set by the server when creating the new object)"""
+        """Get an object by ID
+
+        :param object_id: the ID is the one set by the server when creating the new object"""
         for obj in self.objects:
             if hasattr(obj, 'id') and int(obj.id) == int(object_id):
                 return obj
         raise InvalidMISPObject('Object with {} does not exist in this event'.format(object_id))
 
     def get_object_by_uuid(self, object_uuid: str) -> MISPObject:
-        """Get an object by UUID (UUID is set by the server when creating the new object)"""
+        """Get an object by UUID
+
+        :param object_uuid: the UUID is set by the server when creating the new object"""
         for obj in self.objects:
             if hasattr(obj, 'uuid') and obj.uuid == object_uuid:
                 return obj
         raise InvalidMISPObject('Object with {} does not exist in this event'.format(object_uuid))
 
     def get_objects_by_name(self, object_name: str) -> List[MISPObject]:
-        """Get an object by UUID (UUID is set by the server when creating the new object)"""
+        """Get objects by name
+
+        :param object_name: name is set by the server when creating the new object"""
         objects = []
         for obj in self.objects:
             if hasattr(obj, 'uuid') and obj.name == object_name:

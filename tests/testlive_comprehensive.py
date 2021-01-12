@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, date, timezone
 from io import BytesIO
 import json
 from pathlib import Path
+import hashlib
 
 import urllib3  # type: ignore
 import time
@@ -59,6 +60,7 @@ class TestComprehensive(unittest.TestCase):
         # Connect as admin
         cls.admin_misp_connector = PyMISP(url, key, verifycert, debug=False)
         cls.admin_misp_connector.set_server_setting('Security.allow_self_registration', True, force=True)
+        cls.admin_misp_connector.set_server_setting('debug', 1, force=True)
         if not fast_mode:
             r = cls.admin_misp_connector.update_misp()
             print(r)
@@ -686,6 +688,43 @@ class TestComprehensive(unittest.TestCase):
             # Delete event
             self.admin_misp_connector.delete_event(first)
 
+    def test_exists(self):
+        """Check event, attribute and object existence"""
+        event = self.create_simple_event()
+        misp_object = MISPObject('domain-ip')
+        attribute = misp_object.add_attribute('domain', value='google.fr')
+        misp_object.add_attribute('ip', value='8.8.8.8')
+        event.add_object(misp_object)
+
+        # Event, attribute and object should not exists before event deletion
+        self.assertFalse(self.user_misp_connector.event_exists(event))
+        self.assertFalse(self.user_misp_connector.attribute_exists(attribute))
+        self.assertFalse(self.user_misp_connector.object_exists(misp_object))
+
+        try:
+            event = self.user_misp_connector.add_event(event, pythonify=True)
+            misp_object = event.objects[0]
+            attribute = misp_object.attributes[0]
+            self.assertTrue(self.user_misp_connector.event_exists(event))
+            self.assertTrue(self.user_misp_connector.event_exists(event.uuid))
+            self.assertTrue(self.user_misp_connector.event_exists(event.id))
+            self.assertTrue(self.user_misp_connector.attribute_exists(attribute))
+            self.assertTrue(self.user_misp_connector.attribute_exists(attribute.uuid))
+            self.assertTrue(self.user_misp_connector.attribute_exists(attribute.id))
+            self.assertTrue(self.user_misp_connector.object_exists(misp_object))
+            self.assertTrue(self.user_misp_connector.object_exists(misp_object.id))
+            self.assertTrue(self.user_misp_connector.object_exists(misp_object.uuid))
+        finally:
+            self.admin_misp_connector.delete_event(event)
+
+        # Event, attribute and object should not exists after event deletion
+        self.assertFalse(self.user_misp_connector.event_exists(event))
+        self.assertFalse(self.user_misp_connector.event_exists(event.id))
+        self.assertFalse(self.user_misp_connector.attribute_exists(attribute))
+        self.assertFalse(self.user_misp_connector.attribute_exists(attribute.id))
+        self.assertFalse(self.user_misp_connector.object_exists(misp_object))
+        self.assertFalse(self.user_misp_connector.object_exists(misp_object.id))
+
     def test_simple_event(self):
         '''Search a bunch of parameters:
             * Value not existing
@@ -870,10 +909,24 @@ class TestComprehensive(unittest.TestCase):
             self.assertIs(events[0].attributes[-1].malware_binary, None)
 
             # Search index
+            # # Timestamp
             events = self.user_misp_connector.search_index(timestamp=first.timestamp.timestamp(),
                                                            pythonify=True)
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0].info, 'foo bar blah')
+            self.assertEqual(events[0].attributes, [])
+
+            # # Info
+            complex_info = r'C:\Windows\System32\notepad.exe'
+            e = events[0]
+            e.info = complex_info
+            e = self.user_misp_connector.update_event(e, pythonify=True)
+            # Issue: https://github.com/MISP/MISP/issues/6616
+            complex_info_search = r'C:\\Windows\\System32\\notepad.exe'
+            events = self.user_misp_connector.search_index(eventinfo=complex_info_search,
+                                                           pythonify=True)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].info, complex_info)
             self.assertEqual(events[0].attributes, [])
 
             # Contact reporter
@@ -883,6 +936,19 @@ class TestComprehensive(unittest.TestCase):
             # Delete event
             self.admin_misp_connector.delete_event(first)
             self.admin_misp_connector.delete_event(second)
+
+    def test_event_add_update_metadata(self):
+        event = self.create_simple_event()
+        event.add_attribute('ip-src', '9.9.9.9')
+        try:
+            response = self.user_misp_connector.add_event(event, metadata=True)
+            self.assertEqual(len(response.attributes), 0)  # response should contains zero attributes
+
+            event.info = "New name"
+            response = self.user_misp_connector.update_event(event, metadata=True)
+            self.assertEqual(len(response.attributes), 0)  # response should contains zero attributes
+        finally:  # cleanup
+            self.admin_misp_connector.delete_event(event)
 
     def test_extend_event(self):
         first = self.create_simple_event()
@@ -1338,6 +1404,19 @@ class TestComprehensive(unittest.TestCase):
             # Delete event
             self.admin_misp_connector.delete_event(first)
 
+        # Search tag
+        # Partial search
+        tags = self.admin_misp_connector.search_tags(f'{new_tag.name[:5]}%', pythonify=True)
+        self.assertEqual(tags[0].name, 'this is a test tag')
+        # No tags found
+        tags = self.admin_misp_connector.search_tags('not a tag')
+        self.assertFalse(tags)
+
+        # Update tag
+        non_exportable_tag.name = 'non-exportable tag - edit'
+        non_exportable_tag_edited = self.admin_misp_connector.update_tag(non_exportable_tag, pythonify=True)
+        self.assertTrue(non_exportable_tag_edited.name == 'non-exportable tag - edit', non_exportable_tag_edited.to_json(indent=2))
+
         # Delete tag
         response = self.admin_misp_connector.delete_tag(new_tag)
         self.assertEqual(response['message'], 'Tag deleted.')
@@ -1572,6 +1651,13 @@ class TestComprehensive(unittest.TestCase):
             self.assertEqual(similar_error['errors'][1]['errors']['value'][0], 'A similar attribute already exists for this event.')
 
             # Test add multiple attributes at once
+            attr0 = MISPAttribute()
+            attr0.value = '0.0.0.0'
+            attr0.type = 'ip-dst'
+            response = self.user_misp_connector.add_attribute(first, [attr0])
+            time.sleep(5)
+            self.assertTrue(isinstance(response['attributes'], list), response['attributes'])
+            self.assertEqual(response['attributes'][0].value, '0.0.0.0')
             attr1 = MISPAttribute()
             attr1.value = '1.2.3.4'
             attr1.type = 'ip-dst'
@@ -1655,7 +1741,7 @@ class TestComprehensive(unittest.TestCase):
             self.assertTrue(isinstance(attribute, MISPShadowAttribute), attribute)
             # Test if add proposal without category works - https://github.com/MISP/MISP/issues/4868
             attribute = self.user_misp_connector.add_attribute(second.id, {'type': 'ip-dst', 'value': '123.43.32.22'})
-            self.assertTrue(isinstance(attribute, MISPShadowAttribute))
+            self.assertTrue(isinstance(attribute, MISPShadowAttribute), attribute)
             # Add attribute with the same value as an existing proposal
             prop_attr.uuid = str(uuid4())
             attribute = self.admin_misp_connector.add_attribute(second, prop_attr, pythonify=True)
@@ -1683,7 +1769,7 @@ class TestComprehensive(unittest.TestCase):
 
             # Test attribute*S*
             attributes = self.admin_misp_connector.attributes()
-            self.assertEqual(len(attributes), 6)
+            self.assertEqual(len(attributes), 7)
             # attributes = self.user_misp_connector.attributes()
             # self.assertEqual(len(attributes), 5)
             # Test event*S*
@@ -2135,11 +2221,36 @@ class TestComprehensive(unittest.TestCase):
     def test_expansion(self):
         first = self.create_simple_event()
         try:
-            with open('tests/viper-test-files/test_files/whoami.exe', 'rb') as f:
-                first.add_attribute('malware-sample', value='whoami.exe', data=BytesIO(f.read()), expand='binary')
+            md5_disk = hashlib.md5()
+            with open('tests/viper-test-files/test_files/sample2.pe', 'rb') as f:
+                filecontent = f.read()
+                md5_disk.update(filecontent)
+                malware_sample_initial_attribute = first.add_attribute('malware-sample', value='Big PE sample', data=BytesIO(filecontent), expand='binary')
+            md5_init_attribute = hashlib.md5()
+            md5_init_attribute.update(malware_sample_initial_attribute.malware_binary.getvalue())
+            self.assertEqual(md5_init_attribute.digest(), md5_disk.digest())
+
             first.run_expansions()
             first = self.admin_misp_connector.add_event(first, pythonify=True)
-            self.assertEqual(len(first.objects), 7)
+            self.assertEqual(len(first.objects), 8, first.objects)
+            # Speed test
+            # # reference time
+            start = time.time()
+            self.admin_misp_connector.get_event(first.id, pythonify=False)
+            ref_time = time.time() - start
+            # # Speed test pythonify
+            start = time.time()
+            first = self.admin_misp_connector.get_event(first.id, pythonify=True)
+            pythonify_time = time.time() - start
+            self.assertTrue((pythonify_time - ref_time) <= 0.5, f'Pythonify too slow: {ref_time} vs. {pythonify_time}.')
+
+            # Test on demand decrypt malware binary
+            file_objects = first.get_objects_by_name('file')
+            samples = file_objects[0].get_attributes_by_relation('malware-sample')
+            binary = samples[0].malware_binary
+            md5_from_server = hashlib.md5()
+            md5_from_server.update(binary.getvalue())
+            self.assertEqual(md5_from_server.digest(), md5_disk.digest())
         finally:
             # Delete event
             self.admin_misp_connector.delete_event(first)
@@ -2275,6 +2386,7 @@ class TestComprehensive(unittest.TestCase):
             # Attribute in object only
             now = datetime.now().astimezone()
             attr = obj.attributes[0]
+            attr.first_seen = '2020-01-04'
             attr.last_seen = now
             attr = self.admin_misp_connector.update_attribute(attr, pythonify=True)
             self.assertEqual(attr.last_seen, now)

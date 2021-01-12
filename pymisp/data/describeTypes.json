@@ -72,6 +72,7 @@
         "pdb",
         "pgp-private-key",
         "pgp-public-key",
+        "process-state",
         "regkey",
         "regkey|value",
         "sha1",
@@ -148,6 +149,7 @@
         "ip-src",
         "ip-src|port",
         "ja3-fingerprint-md5",
+        "jarm-fingerprint",
         "link",
         "mac-address",
         "mac-eui-64",
@@ -218,6 +220,7 @@
         "email-src",
         "email-subject",
         "eppn",
+        "favicon-mmh3",
         "filename-pattern",
         "hassh-md5",
         "hasshserver-md5",
@@ -230,6 +233,7 @@
         "ip-src",
         "ip-src|port",
         "ja3-fingerprint-md5",
+        "jarm-fingerprint",
         "mac-address",
         "mac-eui-64",
         "other",
@@ -321,6 +325,7 @@
         "ip-src",
         "ip-src|port",
         "ja3-fingerprint-md5",
+        "jarm-fingerprint",
         "link",
         "mac-address",
         "mac-eui-64",
@@ -693,6 +698,10 @@
         "default_category": "Network activity",
         "to_ids": 1
       },
+      "favicon-mmh3": {
+        "default_category": "Network activity",
+        "to_ids": 1
+      },
       "filename": {
         "default_category": "Payload delivery",
         "to_ids": 1
@@ -877,6 +886,10 @@
         "default_category": "Social network",
         "to_ids": 0
       },
+      "jarm-fingerprint": {
+        "default_category": "Network activity",
+        "to_ids": 1
+      },
       "kusto-query": {
         "default_category": "Artifacts dropped",
         "to_ids": 0
@@ -1015,6 +1028,10 @@
       },
       "primary-residence": {
         "default_category": "Person",
+        "to_ids": 0
+      },
+      "process-state": {
+        "default_category": "Artifacts dropped",
         "to_ids": 0
       },
       "prtn": {
@@ -1283,6 +1300,7 @@
       "email-thread-index",
       "email-x-mailer",
       "eppn",
+      "favicon-mmh3",
       "filename",
       "filename|authentihash",
       "filename|impfuzzy",
@@ -1329,6 +1347,7 @@
       "issue-date-of-the-visa",
       "ja3-fingerprint-md5",
       "jabber-id",
+      "jarm-fingerprint",
       "kusto-query",
       "last-name",
       "link",
@@ -1364,6 +1383,7 @@
       "place-port-of-original-embarkation",
       "port",
       "primary-residence",
+      "process-state",
       "prtn",
       "redress-number",
       "regkey",
