@@ -9,6 +9,7 @@ import sys
 from io import BytesIO, BufferedIOBase, TextIOBase
 from zipfile import ZipFile
 import uuid
+from uuid import UUID
 from collections import defaultdict
 import logging
 import hashlib
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import List, Optional, Union, IO, Dict, Any
 
 from .abstract import AbstractMISP, MISPTag
-from .exceptions import UnknownMISPObjectTemplate, InvalidMISPObject, PyMISPError, NewEventError, NewAttributeError
+from .exceptions import UnknownMISPObjectTemplate, InvalidMISPObject, PyMISPError, NewEventError, NewAttributeError, NewEventReportError, NewGalaxyClusterError, NewGalaxyClusterRelationError
 
 logger = logging.getLogger('pymisp')
 
@@ -111,11 +112,17 @@ class MISPOrganisation(AbstractMISP):
     def __init__(self):
         super().__init__()
         self.id: int
+        self.name: str
 
     def from_dict(self, **kwargs):
         if 'Organisation' in kwargs:
             kwargs = kwargs['Organisation']
         super(MISPOrganisation, self).from_dict(**kwargs)
+
+    def __repr__(self) -> str:
+        if hasattr(self, 'name'):
+            return f'<{self.__class__.__name__}(type={self.name})'
+        return f'<{self.__class__.__name__}(NotInitialized)'
 
 
 class MISPSharingGroup(AbstractMISP):
@@ -259,10 +266,12 @@ class MISPAttribute(AbstractMISP):
         if name in ['first_seen', 'last_seen']:
             _datetime = _make_datetime(value)
 
+            # NOTE: the two following should be exceptions, but there are existing events in this state,
+            # And we cannot dump them if it is there.
             if name == 'last_seen' and hasattr(self, 'first_seen') and self.first_seen > _datetime:
-                raise PyMISPError(f'last_seen ({value}) has to be after first_seen ({self.first_seen})')
+                logger.warning(f'last_seen ({value}) has to be after first_seen ({self.first_seen})')
             if name == 'first_seen' and hasattr(self, 'last_seen') and self.last_seen < _datetime:
-                raise PyMISPError(f'first_seen ({value}) has to be before last_seen ({self.last_seen})')
+                logger.warning(f'first_seen ({value}) has to be before last_seen ({self.last_seen})')
             super().__setattr__(name, _datetime)
         elif name == 'data':
             self._prepare_data(value)
@@ -718,9 +727,9 @@ class MISPObject(AbstractMISP):
             value = _make_datetime(value)
 
             if name == 'last_seen' and hasattr(self, 'first_seen') and self.first_seen > value:
-                raise PyMISPError('last_seen ({value}) has to be after first_seen ({self.first_seen})')
+                logger.warning(f'last_seen ({value}) has to be after first_seen ({self.first_seen})')
             if name == 'first_seen' and hasattr(self, 'last_seen') and self.last_seen < value:
-                raise PyMISPError('first_seen ({value}) has to be before last_seen ({self.last_seen})')
+                logger.warning(f'first_seen ({value}) has to be before last_seen ({self.last_seen})')
         super().__setattr__(name, value)
 
     def force_misp_objects_path_custom(self, misp_objects_path_custom: Union[Path, str], object_name: Optional[str] = None):
@@ -749,6 +758,10 @@ class MISPObject(AbstractMISP):
         else:
             # Then we have no meta-category, template_uuid, description and template_version
             pass
+
+    def delete(self):
+        """Mark the object as deleted (soft delete)"""
+        self.deleted = True
 
     @property
     def disable_validation(self):
@@ -904,14 +917,23 @@ class MISPObject(AbstractMISP):
         """Add an attribute. object_relation is required and the value key is a
         dictionary with all the keys supported by MISPAttribute"""
         if simple_value is not None:  # /!\ The value *can* be 0
-            value = {'value': simple_value}
+            value['value'] = simple_value
         if value.get('value') is None:
             logger.warning("The value of the attribute you're trying to add is None, skipping it. Object relation: {}".format(object_relation))
             return None
         else:
+            if isinstance(value['value'], bytes):
+                # That shouldn't happen, but we live in the real world, and it does.
+                # So we try to decode (otherwise, MISP barf), and raise a warning if needed.
+                try:
+                    value['value'] = value['value'].decode()
+                except Exception:
+                    logger.warning("The value of the attribute you're trying to add is a bytestream ({!r}), and we're unable to make it a string.".format(value['value']))
+                    return None
+
             # Make sure we're not adding an empty value.
             if isinstance(value['value'], str):
-                value['value'] = value['value'].strip()
+                value['value'] = value['value'].strip().strip('\x00')
                 if value['value'] == '':
                     logger.warning("The value of the attribute you're trying to add is an empty string, skipping it. Object relation: {}".format(object_relation))
                     return None
@@ -982,6 +1004,391 @@ class MISPObject(AbstractMISP):
         return '<{self.__class__.__name__}(NotInitialized)'.format(self=self)
 
 
+class MISPEventReport(AbstractMISP):
+
+    _fields_for_feed: set = {'uuid', 'name', 'content', 'timestamp', 'deleted'}
+
+    def from_dict(self, **kwargs):
+        if 'EventReport' in kwargs:
+            kwargs = kwargs['EventReport']
+
+        self.distribution = kwargs.pop('distribution', None)
+        if self.distribution is not None:
+            self.distribution = int(self.distribution)
+            if self.distribution not in [0, 1, 2, 3, 4, 5]:
+                raise NewEventReportError('{} is invalid, the distribution has to be in 0, 1, 2, 3, 4, 5'.format(self.distribution))
+
+        if kwargs.get('sharing_group_id'):
+            self.sharing_group_id = int(kwargs.pop('sharing_group_id'))
+
+        if self.distribution == 4:
+            # The distribution is set to sharing group, a sharing_group_id is required.
+            if not hasattr(self, 'sharing_group_id'):
+                raise NewEventReportError('If the distribution is set to sharing group, a sharing group ID is required.')
+            elif not self.sharing_group_id:
+                # Cannot be None or 0 either.
+                raise NewEventReportError('If the distribution is set to sharing group, a sharing group ID is required (cannot be {}).'.format(self.sharing_group_id))
+
+        self.name = kwargs.pop('name', None)
+        if self.name is None:
+            raise NewEventReportError('The name of the event report is required.')
+
+        self.content = kwargs.pop('content', None)
+        if self.content is None:
+            raise NewAttributeError('The content of the event report is required.')
+
+        if kwargs.get('id'):
+            self.id = int(kwargs.pop('id'))
+        if kwargs.get('event_id'):
+            self.event_id = int(kwargs.pop('event_id'))
+        if kwargs.get('timestamp'):
+            ts = kwargs.pop('timestamp')
+            if isinstance(ts, datetime):
+                self.timestamp = ts
+            else:
+                self.timestamp = datetime.fromtimestamp(int(ts), timezone.utc)
+        if kwargs.get('deleted'):
+            self.deleted = kwargs.pop('deleted')
+
+        super().from_dict(**kwargs)
+
+    def __repr__(self) -> str:
+        if hasattr(self, 'name'):
+            return '<{self.__class__.__name__}(name={self.name})'.format(self=self)
+        return '<{self.__class__.__name__}(NotInitialized)'.format(self=self)
+
+    def _set_default(self):
+        if not hasattr(self, 'timestamp'):
+            self.timestamp = datetime.timestamp(datetime.now())
+        if not hasattr(self, 'name'):
+            self.name = ''
+        if not hasattr(self, 'content'):
+            self.content = ''
+
+
+class MISPGalaxyClusterElement(AbstractMISP):
+    """A MISP Galaxy cluster element, providing further info on a cluster
+
+    Creating a new galaxy cluster element can take the following parameters
+
+    :param key: The key/identifier of the element
+    :type key: str
+    :param value: The value of the element
+    :type value: str
+    """
+
+    key: str
+    value: str
+
+    def __repr__(self) -> str:
+        if hasattr(self, 'key') and hasattr(self, 'value'):
+            return '<{self.__class__.__name__}(key={self.key}, value={self.value})'.format(self=self)
+        return '<{self.__class__.__name__}(NotInitialized)'.format(self=self)
+
+    def __setattr__(self, key, value):
+        if key == "value" and isinstance(value, list):
+            raise PyMISPError("You tried to set a list to a cluster element's value. "
+                              "Instead, create seperate elements for each value")
+        super().__setattr__(key, value)
+
+    def from_dict(self, **kwargs):
+        if kwargs.get('id'):
+            self.id = int(kwargs.pop('id'))
+        if kwargs.get('galaxy_cluster_id'):
+            self.galaxy_cluster_id = int(kwargs.pop('galaxy_cluster_id'))
+
+        super().from_dict(**kwargs)
+
+
+class MISPGalaxyClusterRelation(AbstractMISP):
+    """A MISP Galaxy cluster relation, linking one cluster to another
+
+    Creating a new galaxy cluster can take the following parameters
+
+    :param galaxy_cluster_uuid: The UUID of the galaxy the relation links to
+    :type galaxy_cluster_uuid: uuid
+    :param referenced_galaxy_cluster_type: The relation type, e.g. dropped-by
+    :type referenced_galaxy_cluster_type: str
+    :param referenced_galaxy_cluster_uuid: The UUID of the related galaxy
+    :type referenced_galaxy_cluster_uuid: uuid
+    :param distribution: The distribution of the relation, one of 0, 1, 2, 3, 4, default 0
+    :type distribution: int
+    :param sharing_group_id: The sharing group of the relation, only when distribution is 4
+    :type sharing_group_id: int, optional
+    """
+
+    def __repr__(self) -> str:
+        if hasattr(self, "referenced_galaxy_cluster_type"):
+            return '<{self.__class__.__name__}(referenced_galaxy_cluster_type={self.referenced_galaxy_cluster_type})'.format(self=self)
+        return '<{self.__class__.__name__}(NotInitialized)'.format(self=self)
+
+    def __init__(self):
+        super().__init__()
+        self.galaxy_cluster_uuid: uuid
+        self.referenced_galaxy_cluster_uuid: uuid
+        self.distribution: int = 0
+        self.referenced_galaxy_cluster_type: str
+        self.Tag: List[MISPTag] = []
+
+    def from_dict(self, **kwargs):
+        # Default values for a valid event to send to a MISP instance
+        self.distribution = int(kwargs.pop('distribution', 0))
+        if self.distribution not in [0, 1, 2, 3, 4, 5]:
+            raise NewGalaxyClusterRelationError(f'{self.distribution} is invalid, the distribution has to be in 0, 1, 2, 3, 4')
+
+        if kwargs.get('sharing_group_id'):
+            self.sharing_group_id = int(kwargs.pop('sharing_group_id'))
+
+        if self.distribution == 4:
+            # The distribution is set to sharing group, a sharing_group_id is required.
+            if not hasattr(self, 'sharing_group_id'):
+                raise NewGalaxyClusterRelationError('If the distribution is set to sharing group, a sharing group ID is required.')
+            elif not self.sharing_group_id:
+                # Cannot be None or 0 either.
+                raise NewGalaxyClusterRelationError('If the distribution is set to sharing group, a sharing group ID is required (cannot be {}).'.format(self.sharing_group_id))
+
+        if kwargs.get('id'):
+            self.id = int(kwargs.pop('id'))
+        if kwargs.get('orgc_id'):
+            self.orgc_id = int(kwargs.pop('orgc_id'))
+        if kwargs.get('org_id'):
+            self.org_id = int(kwargs.pop('org_id'))
+        if kwargs.get('galaxy_id'):
+            self.galaxy_id = int(kwargs.pop('galaxy_id'))
+        if kwargs.get('tag_id'):
+            self.tag_id = int(kwargs.pop('tag_id'))
+        if kwargs.get('sharing_group_id'):
+            self.sharing_group_id = int(kwargs.pop('sharing_group_id'))
+        if kwargs.get('Tag'):
+            [self.add_tag(**t) for t in kwargs.pop('Tag')]
+        if kwargs.get('SharingGroup'):
+            self.SharingGroup = MISPSharingGroup()
+            self.SharingGroup.from_dict(**kwargs.pop('SharingGroup'))
+        super().from_dict(**kwargs)
+
+    def add_tag(self, tag: Optional[Union[str, MISPTag, Dict]] = None, **kwargs) -> MISPTag:
+        return super()._add_tag(tag, **kwargs)
+
+    @property
+    def tags(self) -> List[MISPTag]:
+        """Returns a list of tags associated to this Attribute"""
+        return self.Tag
+
+    @tags.setter
+    def tags(self, tags: List[MISPTag]):
+        """Set a list of prepared MISPTag."""
+        super()._set_tags(tags)
+
+
+class MISPGalaxyCluster(AbstractMISP):
+    """A MISP galaxy cluster, storing respective galaxy elements and relations.
+    Used to view default galaxy clusters and add/edit/update/delete Galaxy 2.0 clusters
+
+    Creating a new galaxy cluster can take the following parameters
+
+    :param value: The value of the galaxy cluster
+    :type value: str
+    :param description: The description of the galaxy cluster
+    :type description: str
+    :param distribution: The distribution type, one of 0, 1, 2, 3, 4
+    :type distribution: int
+    :param sharing_group_id: The sharing group ID, if distribution is set to 4
+    :type sharing_group_id: int, optional
+    :param authors: A list of authors of the galaxy cluster
+    :type authors: list[str], optional
+    :param cluster_elements: List of MISPGalaxyClusterElement
+    :type cluster_elements: list[MISPGalaxyClusterElement], optional
+    :param cluster_relations: List of MISPGalaxyClusterRelation
+    :type cluster_relations: list[MISPGalaxyClusterRelation], optional
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.Galaxy: MISPGalaxy
+        self.GalaxyElement: List[MISPGalaxyClusterElement] = []
+        self.meta = {}
+        self.GalaxyClusterRelation: List[MISPGalaxyClusterRelation] = []
+        self.Org: MISPOrganisation
+        self.Orgc: MISPOrganisation
+        self.SharingGroup: MISPSharingGroup
+        self.value: str
+        # Set any inititialized cluster to be False
+        self.default = False
+
+    @property
+    def cluster_elements(self) -> List[MISPGalaxyClusterElement]:
+        return self.GalaxyElement
+
+    @cluster_elements.setter
+    def cluster_elements(self, cluster_elements: List[MISPGalaxyClusterElement]):
+        self.GalaxyElement = cluster_elements
+
+    @property
+    def cluster_relations(self) -> List[MISPGalaxyClusterRelation]:
+        return self.GalaxyClusterRelation
+
+    @cluster_relations.setter
+    def cluster_relations(self, cluster_relations: List[MISPGalaxyClusterRelation]):
+        self.GalaxyClusterRelation = cluster_relations
+
+    def parse_meta_as_elements(self):
+        """Function to parse the meta field into GalaxyClusterElements"""
+        # Parse the cluster elements from the kwargs meta fields
+        for key, value in self.meta.items():
+            # The meta will merge fields together, i.e. Two 'countries' will be a list, so split these up
+            if not isinstance(value, list):
+                value = [value]
+            for v in value:
+                self.add_cluster_element(key=key, value=v)
+
+    @property
+    def elements_meta(self) -> Dict:
+        """Function to return the galaxy cluster elements as a dictionary structure of lists
+        that comes from a MISPGalaxy within a MISPEvent. Lossy, you lose the element ID
+        """
+        response = defaultdict(list)
+        for element in self.cluster_elements:
+            response[element.key].append(element.value)
+        return dict(response)
+
+    def from_dict(self, **kwargs):
+        if 'GalaxyCluster' in kwargs:
+            kwargs = kwargs['GalaxyCluster']
+        self.default = kwargs.pop('default', False)
+        # If the default field is set, we shouldn't have distribution or sharing group ID set
+        if self.default:
+            blocked_fields = ["distribution" "sharing_group_id"]
+            for field in blocked_fields:
+                if kwargs.get(field, None):
+                    raise NewGalaxyClusterError(
+                        f"The field '{field}' cannot be set on a default galaxy cluster"
+                    )
+
+        self.distribution = int(kwargs.pop('distribution', 0))
+        if self.distribution not in [0, 1, 2, 3, 4]:
+            raise NewGalaxyClusterError(f'{self.distribution} is invalid, the distribution has to be in 0, 1, 2, 3, 4')
+
+        if kwargs.get('sharing_group_id'):
+            self.sharing_group_id = int(kwargs.pop('sharing_group_id'))
+
+        if self.distribution == 4:
+            # The distribution is set to sharing group, a sharing_group_id is required.
+            if not hasattr(self, 'sharing_group_id'):
+                raise NewGalaxyClusterError('If the distribution is set to sharing group, a sharing group ID is required.')
+            elif not self.sharing_group_id:
+                # Cannot be None or 0 either.
+                raise NewGalaxyClusterError('If the distribution is set to sharing group, a sharing group ID is required (cannot be {}).'.format(self.sharing_group_id))
+
+        if 'uuid' in kwargs:
+            self.uuid = kwargs.pop('uuid')
+        if 'meta' in kwargs:
+            self.meta = kwargs.pop('meta')
+        if 'Galaxy' in kwargs:
+            self.Galaxy = MISPGalaxy()
+            self.Galaxy.from_dict(**kwargs.pop('Galaxy'))
+        if 'GalaxyElement' in kwargs:
+            [self.add_cluster_element(**e) for e in kwargs.pop('GalaxyElement')]
+        if 'Org' in kwargs:
+            self.Org = MISPOrganisation()
+            self.Org.from_dict(**kwargs.pop('Org'))
+        if 'Orgc' in kwargs:
+            self.Orgc = MISPOrganisation()
+            self.Orgc.from_dict(**kwargs.pop('Orgc'))
+        if 'GalaxyClusterRelation' in kwargs:
+            [self.add_cluster_relation(**r) for r in kwargs.pop('GalaxyClusterRelation')]
+        if 'SharingGroup' in kwargs:
+            self.SharingGroup = MISPSharingGroup()
+            self.SharingGroup.from_dict(**kwargs.pop('SharingGroup'))
+        super().from_dict(**kwargs)
+
+    def add_cluster_element(self, key: str, value: str, **kwargs) -> MISPGalaxyClusterElement:
+        """Add a cluster relation to a MISPGalaxyCluster, key and value are required
+
+        :param key: The key name of the element
+        :type key: str
+        :param value: The value of the element
+        :type value: str
+        """
+
+        cluster_element = MISPGalaxyClusterElement()
+        cluster_element.from_dict(key=key, value=value, **kwargs)
+        self.cluster_elements.append(cluster_element)
+        return cluster_element
+
+    def add_cluster_relation(self, referenced_galaxy_cluster_uuid: Union["MISPGalaxyCluster", str, UUID], referenced_galaxy_cluster_type: str, galaxy_cluster_uuid: str = None, **kwargs) -> MISPGalaxyClusterRelation:
+        """Add a cluster relation to a MISPGalaxyCluster.
+
+        :param referenced_galaxy_cluster_uuid: UUID of the related cluster
+        :type referenced_galaxy_cluster_uuid: uuid
+        :param referenced_galaxy_cluster_type: Relation type
+        :type referenced_galaxy_cluster_type: uuid
+        :param galaxy_cluster_uuid: UUID of this cluster, leave blank to use the stored UUID
+        :param galaxy_cluster_uuid: uuid, Optional
+        """
+
+        if not getattr(self, "uuid", None):
+            raise PyMISPError("The cluster does not have a UUID, make sure it is a valid galaxy cluster")
+        cluster_relation = MISPGalaxyClusterRelation()
+
+        if isinstance(referenced_galaxy_cluster_uuid, MISPGalaxyCluster):
+            referenced_galaxy_cluster_uuid = referenced_galaxy_cluster_uuid.uuid
+
+        cluster_relation.from_dict(
+            referenced_galaxy_cluster_uuid=referenced_galaxy_cluster_uuid,
+            referenced_galaxy_cluster_type=referenced_galaxy_cluster_type,
+            galaxy_cluster_uuid=galaxy_cluster_uuid or self.uuid,
+            **kwargs
+        )
+        self.cluster_relations.append(cluster_relation)
+        return cluster_relation
+
+    def __repr__(self) -> str:
+        if hasattr(self, 'value'):
+            return '<{self.__class__.__name__}(value={self.value})'.format(self=self)
+        return '<{self.__class__.__name__}(NotInitialized)'.format(self=self)
+
+
+class MISPGalaxy(AbstractMISP):
+    """Galaxy class, used to view a galaxy and respective clusters"""
+
+    def __init__(self):
+        super().__init__()
+        self.GalaxyCluster: List[MISPGalaxyCluster] = []
+        self.name: str
+
+    def from_dict(self, **kwargs):
+        """Galaxy could be in one of the following formats:
+        {'Galaxy': {}, 'GalaxyCluster': []}
+        {'Galaxy': {'GalaxyCluster': []}}
+        """
+
+        if 'GalaxyCluster' in kwargs and kwargs.get("withCluster", True):
+            # Parse the cluster from the kwargs
+            [self.add_galaxy_cluster(**e) for e in kwargs.pop('GalaxyCluster')]
+
+        if 'Galaxy' in kwargs:
+            kwargs = kwargs['Galaxy']
+        super().from_dict(**kwargs)
+
+    @property
+    def clusters(self) -> List[MISPGalaxyCluster]:
+        return self.GalaxyCluster
+
+    def add_galaxy_cluster(self, **kwargs) -> MISPGalaxyCluster:
+        """Add a MISP galaxy cluster into a MISPGalaxy.
+        Supports all other parameters supported by MISPGalaxyCluster"""
+
+        galaxy_cluster = MISPGalaxyCluster()
+        galaxy_cluster.from_dict(**kwargs)
+        self.clusters.append(galaxy_cluster)
+        return galaxy_cluster
+
+    def __repr__(self) -> str:
+        if hasattr(self, 'name'):
+            return '<{self.__class__.__name__}(name={self.name})'.format(self=self)
+        return '<{self.__class__.__name__}(NotInitialized)'.format(self=self)
+
+
 class MISPEvent(AbstractMISP):
 
     _fields_for_feed: set = {'uuid', 'info', 'threat_level_id', 'analysis', 'timestamp',
@@ -1005,7 +1412,9 @@ class MISPEvent(AbstractMISP):
         self.RelatedEvent: List[MISPEvent] = []
         self.ShadowAttribute: List[MISPShadowAttribute] = []
         self.SharingGroup: MISPSharingGroup
+        self.EventReport: List[MISPEventReport] = []
         self.Tag: List[MISPTag] = []
+        self.Galaxy: List[MISPGalaxy] = []
 
     def add_tag(self, tag: Optional[Union[str, MISPTag, dict]] = None, **kwargs) -> MISPTag:
         return super()._add_tag(tag, **kwargs)
@@ -1150,6 +1559,10 @@ class MISPEvent(AbstractMISP):
             raise PyMISPError('All the attributes have to be of type MISPAttribute.')
 
     @property
+    def event_reports(self) -> List[MISPEventReport]:
+        return self.EventReport
+
+    @property
     def shadow_attributes(self) -> List[MISPShadowAttribute]:
         return self.ShadowAttribute
 
@@ -1163,6 +1576,10 @@ class MISPEvent(AbstractMISP):
     @property
     def related_events(self) -> List['MISPEvent']:
         return self.RelatedEvent
+
+    @property
+    def galaxies(self) -> List[MISPGalaxy]:
+        return self.Galaxy
 
     @property
     def objects(self) -> List[MISPObject]:
@@ -1272,6 +1689,10 @@ class MISPEvent(AbstractMISP):
             self.set_date(kwargs.pop('date'))
         if kwargs.get('Attribute'):
             [self.add_attribute(**a) for a in kwargs.pop('Attribute')]
+        if kwargs.get('Galaxy'):
+            [self.add_galaxy(**e) for e in kwargs.pop('Galaxy')]
+        if kwargs.get('EventReport'):
+            [self.add_event_report(**e) for e in kwargs.pop('EventReport')]
 
         # All other keys
         if kwargs.get('id'):
@@ -1306,6 +1727,7 @@ class MISPEvent(AbstractMISP):
         if kwargs.get('SharingGroup'):
             self.SharingGroup = MISPSharingGroup()
             self.SharingGroup.from_dict(**kwargs.pop('SharingGroup'))
+
         super(MISPEvent, self).from_dict(**kwargs)
 
     def to_dict(self) -> Dict:
@@ -1412,6 +1834,23 @@ class MISPEvent(AbstractMISP):
             return attr_list
         return attribute
 
+    def add_event_report(self, name: str, content: str, **kwargs) -> MISPEventReport:
+        """Add an event report. name and value are requred but you can pass all
+        other parameters supported by MISPEventReport"""
+        event_report = MISPEventReport()
+        event_report.from_dict(name=name, content=content, **kwargs)
+        self.event_reports.append(event_report)
+        self.edited = True
+        return event_report
+
+    def add_galaxy(self, **kwargs) -> MISPGalaxy:
+        """Add a MISP galaxy and sub-clusters into an event.
+        Supports all other parameters supported by MISPGalaxy"""
+        galaxy = MISPGalaxy()
+        galaxy.from_dict(**kwargs)
+        self.galaxies.append(galaxy)
+        return galaxy
+
     def get_object_by_id(self, object_id: Union[str, int]) -> MISPObject:
         """Get an object by ID
 
@@ -1460,6 +1899,19 @@ class MISPEvent(AbstractMISP):
         self.Object.append(misp_obj)
         self.edited = True
         return misp_obj
+
+    def delete_object(self, object_id: str):
+        """Delete an object
+
+        :param object_id: ID or UUID
+        """
+        for o in self.objects:
+            if ((hasattr(o, 'id') and o.id == object_id)
+                    or (hasattr(o, 'uuid') and o.uuid == object_id)):
+                o.delete()
+                break
+        else:
+            raise PyMISPError('No object with UUID/ID {} found.'.format(object_id))
 
     def run_expansions(self):
         for index, attribute in enumerate(self.attributes):
@@ -1604,17 +2056,12 @@ class MISPWarninglist(AbstractMISP):
 
 class MISPTaxonomy(AbstractMISP):
 
+    name: str
+    enabled: bool
+
     def from_dict(self, **kwargs):
         if 'Taxonomy' in kwargs:
             kwargs = kwargs['Taxonomy']
-        super().from_dict(**kwargs)
-
-
-class MISPGalaxy(AbstractMISP):
-
-    def from_dict(self, **kwargs):
-        if 'Galaxy' in kwargs:
-            kwargs = kwargs['Galaxy']
         super().from_dict(**kwargs)
 
 
@@ -1623,6 +2070,14 @@ class MISPNoticelist(AbstractMISP):
     def from_dict(self, **kwargs):
         if 'Noticelist' in kwargs:
             kwargs = kwargs['Noticelist']
+        super().from_dict(**kwargs)
+
+
+class MISPCorrelationExclusion(AbstractMISP):
+
+    def from_dict(self, **kwargs):
+        if 'CorrelationExclusion' in kwargs:
+            kwargs = kwargs['CorrelationExclusion']
         super().from_dict(**kwargs)
 
 

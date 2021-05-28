@@ -107,7 +107,7 @@ class AbstractMISP(MutableMapping, MISPFileCache, metaclass=ABCMeta):
         NOTE: Every method in every classes inheriting this one are doing
               changes in memory and  do not modify data on a remote MISP instance.
               To do so, you need to call the respective add_* or update_*
-              methods in ExpandedPyMISP/PyMISP.
+              methods in PyMISP.
         """
         super().__init__()
         self.__edited: bool = True  # As we create a new object, we assume it is edited
@@ -237,7 +237,7 @@ class AbstractMISP(MutableMapping, MISPFileCache, metaclass=ABCMeta):
         to_return = _int_to_str(to_return)
         return to_return
 
-    def to_json(self, sort_keys: bool = False, indent: Optional[int] = None):
+    def to_json(self, sort_keys: bool = False, indent: Optional[int] = None) -> str:
         """Dump recursively any class of type MISPAbstract to a json string"""
         return dumps(self, default=pymisp_json_default, sort_keys=sort_keys, indent=indent)
 

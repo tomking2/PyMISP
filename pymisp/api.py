@@ -15,6 +15,7 @@ from uuid import UUID
 import warnings
 import sys
 import copy
+import urllib3  # type: ignore
 from io import BytesIO, StringIO
 
 from . import __version__, everything_broken
@@ -23,7 +24,8 @@ from .mispevent import MISPEvent, MISPAttribute, MISPSighting, MISPLog, MISPObje
     MISPUser, MISPOrganisation, MISPShadowAttribute, MISPWarninglist, MISPTaxonomy, \
     MISPGalaxy, MISPNoticelist, MISPObjectReference, MISPObjectTemplate, MISPSharingGroup, \
     MISPRole, MISPServer, MISPFeed, MISPEventDelegation, MISPCommunity, MISPUserSetting, \
-    MISPInbox, MISPEventBlocklist, MISPOrganisationBlocklist
+    MISPInbox, MISPEventBlocklist, MISPOrganisationBlocklist, MISPEventReport, \
+    MISPGalaxyCluster, MISPGalaxyClusterRelation, MISPCorrelationExclusion
 from .abstract import pymisp_json_default, MISPTag, AbstractMISP, describe_types
 
 SearchType = TypeVar('SearchType', str, int)
@@ -35,7 +37,7 @@ ToIDSType = TypeVar('ToIDSType', str, int, bool)
 logger = logging.getLogger('pymisp')
 
 
-def get_uuid_or_id_from_abstract_misp(obj: Union[AbstractMISP, int, str, UUID]) -> Union[str, int]:
+def get_uuid_or_id_from_abstract_misp(obj: Union[AbstractMISP, int, str, UUID, dict]) -> Union[str, int]:
     """Extract the relevant ID accordingly to the given type passed as parameter"""
     if isinstance(obj, UUID):
         return str(obj)
@@ -87,6 +89,32 @@ def register_user(misp_url: str, email: str,
     return r.json()
 
 
+def brotli_supported() -> bool:
+    """
+    Returns whether Brotli compression is supported
+    """
+
+    # urllib >= 1.25.1 includes brotli support
+    version_splitted = urllib3.__version__.split('.')  # noqa: F811
+    if len(version_splitted) == 2:
+        major, minor = version_splitted
+        patch = 0
+    else:
+        major, minor, patch = version_splitted
+    major, minor, patch = int(major), int(minor), int(patch)
+    urllib3_with_brotli = (major == 1 and ((minor == 25 and patch >= 1) or (minor >= 26))) or major >= 2
+
+    if not urllib3_with_brotli:
+        return False
+
+    # pybrotli is an extra package required by urllib3 for brotli support
+    try:
+        import brotli  # type: ignore # noqa
+        return True
+    except ImportError:
+        return False
+
+
 class PyMISP:
     """Python API for MISP
 
@@ -117,6 +145,8 @@ class PyMISP:
         self.tool: str = tool
         self.timeout: Optional[Union[float, Tuple[float, float]]] = timeout
         self.__session = requests.Session()  # use one session to keep connection between requests
+        if brotli_supported():
+            self.__session.headers['Accept-Encoding'] = ', '.join(('br', 'gzip', 'deflate'))
 
         self.global_pythonify = False
 
@@ -286,10 +316,12 @@ class PyMISP:
                   extended: Union[bool, int] = False,
                   includeRelatedTags: bool = False,
                   pythonify: bool = False) -> Union[Dict, MISPEvent]:
-        """Get an event from a MISP instance
+        """Get an event from a MISP instance. Includes collections like
+        Attribute, EventReport, Feed, Galaxy, Object, Tag, etc. so the
+        response size may be large.
 
         :param event: event to get
-        :param deleted: whether to include deleted events
+        :param deleted: whether to include soft-deleted attributes
         :param extended: whether to get extended events
         :param includeRelatedTags: whether to get more relational information
         :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
@@ -393,6 +425,93 @@ class PyMISP:
 
     # ## END Event ###
 
+    # ## BEGIN Event Report ###
+
+    def get_event_report(self, event_report: Union[MISPEventReport, int, str, UUID],
+                         pythonify: bool = False) -> Union[Dict, MISPEventReport]:
+        """Get an event report from a MISP instance
+
+        :param event_report: event report to get
+        :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
+        """
+        event_report_id = get_uuid_or_id_from_abstract_misp(event_report)
+        r = self._prepare_request('GET', f'eventReports/view/{event_report_id}')
+        event_report_r = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in event_report_r:
+            return event_report_r
+        er = MISPEventReport()
+        er.from_dict(**event_report_r)
+        return er
+
+    def get_event_reports(self, event_id: Union[int, str],
+                          pythonify: bool = False) -> Union[Dict, List[MISPEventReport]]:
+        """Get event report from a MISP instance that are attached to an event ID
+
+        :param event_id: event id to get the event reports for
+        :param pythonify: Returns a list of PyMISP Objects instead of the plain json output.
+        """
+        r = self._prepare_request('GET', f'eventReports/index/event_id:{event_id}')
+        event_reports = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in event_reports:
+            return event_reports
+        to_return = []
+        for event_report in event_reports:
+            er = MISPEventReport()
+            er.from_dict(**event_report)
+            to_return.append(er)
+        return to_return
+
+    def add_event_report(self, event: Union[MISPEvent, int, str, UUID], event_report: MISPEventReport, pythonify: bool = False) -> Union[Dict, MISPEventReport]:
+        """Add an event report to an existing MISP event
+
+        :param event: event to extend
+        :param event_report: event report to add.
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+        event_id = get_uuid_or_id_from_abstract_misp(event)
+        r = self._prepare_request('POST', f'eventReports/add/{event_id}', data=event_report)
+        new_event_report = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in new_event_report:
+            return new_event_report
+        er = MISPEventReport()
+        er.from_dict(**new_event_report)
+        return er
+
+    def update_event_report(self, event_report: MISPEventReport, event_report_id: Optional[int] = None, pythonify: bool = False) -> Union[Dict, MISPEventReport]:
+        """Update an event report on a MISP instance
+
+        :param event_report: event report to update
+        :param event_report_id: event report ID to update
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+        if event_report_id is None:
+            erid = get_uuid_or_id_from_abstract_misp(event_report)
+        else:
+            erid = get_uuid_or_id_from_abstract_misp(event_report_id)
+        r = self._prepare_request('POST', f'eventReports/edit/{erid}', data=event_report)
+        updated_event_report = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in updated_event_report:
+            return updated_event_report
+        er = MISPEventReport()
+        er.from_dict(**updated_event_report)
+        return er
+
+    def delete_event_report(self, event_report: Union[MISPEventReport, int, str, UUID], hard: bool = False) -> Dict:
+        """Delete an event report from a MISP instance
+
+        :param event_report: event report to delete
+        :param hard: flag for hard delete
+        """
+        event_report_id = get_uuid_or_id_from_abstract_misp(event_report)
+        request_url = f'eventReports/delete/{event_report_id}'
+        data = {}
+        if hard:
+            data['hard'] = 1
+        r = self._prepare_request('POST', request_url, data=data)
+        return self._check_json_response(r)
+
+    # ## END Event Report ###
+
     # ## BEGIN Object ###
 
     def get_object(self, misp_object: Union[MISPObject, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPObject]:
@@ -419,15 +538,17 @@ class PyMISP:
         r = self._prepare_request('HEAD', f'objects/view/{object_id}')
         return self._check_head_response(r)
 
-    def add_object(self, event: Union[MISPEvent, int, str, UUID], misp_object: MISPObject, pythonify: bool = False) -> Union[Dict, MISPObject]:
+    def add_object(self, event: Union[MISPEvent, int, str, UUID], misp_object: MISPObject, pythonify: bool = False, break_on_duplicate: bool = False) -> Union[Dict, MISPObject]:
         """Add a MISP Object to an existing MISP event
 
         :param event: event to extend
         :param misp_object: object to add
         :param pythonify: Returns a PyMISP Object instead of the plain json output
+        :param break_on_duplicate: if True, check and reject if this object's attributes match an existing object's attributes; may require much time
         """
         event_id = get_uuid_or_id_from_abstract_misp(event)
-        r = self._prepare_request('POST', f'objects/add/{event_id}', data=misp_object)
+        params = {'breakOnDuplicate': True} if break_on_duplicate else {}
+        r = self._prepare_request('POST', f'objects/add/{event_id}', data=misp_object, kw_params=params)
         new_object = self._check_json_response(r)
         if not (self.global_pythonify or pythonify) or 'errors' in new_object:
             return new_object
@@ -454,14 +575,18 @@ class PyMISP:
         o.from_dict(**updated_object)
         return o
 
-    def delete_object(self, misp_object: Union[MISPObject, int, str, UUID]) -> Dict:
+    def delete_object(self, misp_object: Union[MISPObject, int, str, UUID], hard: bool = False) -> Dict:
         """Delete an object from a MISP instance
 
         :param misp_object: object to delete
+        :param hard: flag for hard delete
         """
         object_id = get_uuid_or_id_from_abstract_misp(misp_object)
-        response = self._prepare_request('POST', f'objects/delete/{object_id}')
-        return self._check_json_response(response)
+        data = {}
+        if hard:
+            data['hard'] = 1
+        r = self._prepare_request('POST', f'objects/delete/{object_id}', data=data)
+        return self._check_json_response(r)
 
     def add_object_reference(self, misp_object_reference: MISPObjectReference, pythonify: bool = False) -> Union[Dict, MISPObjectReference]:
         """Add a reference to an object
@@ -518,6 +643,13 @@ class PyMISP:
         t = MISPObjectTemplate()
         t.from_dict(**object_template_r)
         return t
+
+    def get_raw_object_template(self, uuid_or_name: str) -> Dict:
+        """Get a row template. It needs to be present on disk on the MISP instance you're connected to.
+        The response of this method can be passed to MISPObject(<name>, misp_objects_template_custom=<response>)
+        """
+        r = self._prepare_request('GET', f'objectTemplates/getRaw/{uuid_or_name}')
+        return self._check_json_response(r)
 
     def update_object_templates(self) -> Dict:
         """Trigger an update of the object templates"""
@@ -832,12 +964,12 @@ class PyMISP:
 
     # ## BEGIN Tags ###
 
-    def tags(self, pythonify: bool = False) -> Union[Dict, List[MISPTag]]:
+    def tags(self, pythonify: bool = False, **kw_params) -> Union[Dict, List[MISPTag]]:
         """Get the list of existing tags.
 
         :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
         """
-        r = self._prepare_request('GET', 'tags/index')
+        r = self._prepare_request('GET', 'tags/index', kw_params=kw_params)
         tags = self._check_json_response(r)
         if not (self.global_pythonify or pythonify) or 'errors' in tags:
             return tags['Tag']
@@ -1013,7 +1145,10 @@ class PyMISP:
         """
         taxonomy_id = get_uuid_or_id_from_abstract_misp(taxonomy)
         t = self.get_taxonomy(taxonomy_id)
-        if not t['Taxonomy']['enabled']:
+        if isinstance(t, MISPTaxonomy) and not t.enabled:
+            # Can happen if global pythonify is enabled.
+            raise PyMISPError(f"The taxonomy {t.name} is not enabled.")
+        elif not t['Taxonomy']['enabled']:
             raise PyMISPError(f"The taxonomy {t['Taxonomy']['name']} is not enabled.")
         url = urljoin(self.root_url, 'taxonomies/addTag/{}'.format(taxonomy_id))
         response = self._prepare_request('POST', url)
@@ -1177,6 +1312,69 @@ class PyMISP:
 
     # ## END Noticelist ###
 
+    # ## BEGIN Correlation Exclusions ###
+
+    def correlation_exclusions(self, pythonify: bool = False) -> Union[Dict, List[MISPCorrelationExclusion]]:
+        """Get all the correlation exclusions
+
+        :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
+        """
+        r = self._prepare_request('GET', 'correlation_exclusions')
+        correlation_exclusions = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in correlation_exclusions:
+            return correlation_exclusions
+        to_return = []
+        for correlation_exclusion in correlation_exclusions:
+            c = MISPCorrelationExclusion()
+            c.from_dict(**correlation_exclusion)
+            to_return.append(c)
+        return to_return
+
+    def get_correlation_exclusion(self, correlation_exclusion: Union[MISPCorrelationExclusion, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPCorrelationExclusion]:
+        """Get a correlation exclusion by ID
+
+        :param correlation_exclusion: Correlation exclusion to get
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+        exclusion_id = get_uuid_or_id_from_abstract_misp(correlation_exclusion)
+        r = self._prepare_request('GET', f'correlation_exclusions/view/{exclusion_id}')
+        correlation_exclusion_j = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in correlation_exclusion_j:
+            return correlation_exclusion_j
+        c = MISPCorrelationExclusion()
+        c.from_dict(**correlation_exclusion_j)
+        return c
+
+    def add_correlation_exclusion(self, correlation_exclusion: MISPCorrelationExclusion, pythonify: bool = False) -> Union[Dict, MISPCorrelationExclusion]:
+        """Add a new correlation exclusion
+
+        :param correlation_exclusion: correlation exclusion to add
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+        r = self._prepare_request('POST', 'correlation_exclusions/add', data=correlation_exclusion)
+        new_correlation_exclusion = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in new_correlation_exclusion:
+            return new_correlation_exclusion
+        c = MISPCorrelationExclusion()
+        c.from_dict(**new_correlation_exclusion)
+        return c
+
+    def delete_correlation_exclusion(self, correlation_exclusion: Union[MISPCorrelationExclusion, int, str, UUID]) -> Dict:
+        """Delete a correlation exclusion
+
+        :param correlation_exclusion: The MISPCorrelationExclusion you wish to delete from MISP
+        """
+        exclusion_id = get_uuid_or_id_from_abstract_misp(correlation_exclusion)
+        r = self._prepare_request('POST', f'correlation_exclusions/delete/{exclusion_id}')
+        return self._check_json_response(r)
+
+    def clean_correlation_exclusions(self):
+        """Initiate correlation exclusions cleanup"""
+        r = self._prepare_request('POST', 'correlation_exclusions/clean')
+        return self._check_json_response(r)
+
+    # ## END Correlation Exclusions ###
+
     # ## BEGIN Galaxy ###
 
     def galaxies(self, pythonify: bool = False) -> Union[Dict, List[MISPGalaxy]]:
@@ -1195,10 +1393,11 @@ class PyMISP:
             to_return.append(g)
         return to_return
 
-    def get_galaxy(self, galaxy: Union[MISPGalaxy, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPGalaxy]:
+    def get_galaxy(self, galaxy: Union[MISPGalaxy, int, str, UUID], withCluster: bool = False, pythonify: bool = False) -> Union[Dict, MISPGalaxy]:
         """Get a galaxy by id
 
         :param galaxy: galaxy to get
+        :param withCluster: Include the clusters associated with the galaxy
         :param pythonify: Returns a PyMISP Object instead of the plain json output
         """
         galaxy_id = get_uuid_or_id_from_abstract_misp(galaxy)
@@ -1207,13 +1406,177 @@ class PyMISP:
         if not (self.global_pythonify or pythonify) or 'errors' in galaxy_j:
             return galaxy_j
         g = MISPGalaxy()
-        g.from_dict(**galaxy_j)
+        g.from_dict(**galaxy_j, withCluster=withCluster)
         return g
+
+    def search_galaxy_clusters(self, galaxy: Union[MISPGalaxy, int, str, UUID], context: str = "all", searchall: str = None, pythonify: bool = False) -> Union[Dict, List[MISPGalaxyCluster]]:
+        """Searches the galaxy clusters within a specific galaxy
+
+        :param galaxy: The MISPGalaxy you wish to search in
+        :param context: The context of how you want to search within the galaxy_
+        :param searchall: The search you want to make against the galaxy and context
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+
+        galaxy_id = get_uuid_or_id_from_abstract_misp(galaxy)
+        allowed_context_types: List[str] = ["all", "default", "custom", "org", "deleted"]
+        if context not in allowed_context_types:
+            raise PyMISPError(f"The context must be one of {', '.join(allowed_context_types)}")
+        kw_params = {"context": context}
+        if searchall:
+            kw_params["searchall"] = searchall
+        r = self._prepare_request('GET', f"galaxy_clusters/index/{galaxy_id}", kw_params=kw_params)
+        clusters_j = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in clusters_j:
+            return clusters_j
+        response = []
+        for cluster in clusters_j:
+            c = MISPGalaxyCluster()
+            c.from_dict(**cluster)
+            response.append(c)
+        return response
 
     def update_galaxies(self) -> Dict:
         """Update all the galaxies."""
         response = self._prepare_request('POST', 'galaxies/update')
         return self._check_json_response(response)
+
+    def get_galaxy_cluster(self, galaxy_cluster: Union[MISPGalaxyCluster, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPGalaxyCluster]:
+        """Gets a specific galaxy cluster
+
+        :param galaxy_cluster: The MISPGalaxyCluster you want to get
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+
+        cluster_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster)
+        r = self._prepare_request('GET', f'galaxy_clusters/view/{cluster_id}')
+        cluster_j = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in cluster_j:
+            return cluster_j
+        gc = MISPGalaxyCluster()
+        gc.from_dict(**cluster_j)
+        return gc
+
+    def add_galaxy_cluster(self, galaxy: Union[MISPGalaxy, str, UUID], galaxy_cluster: MISPGalaxyCluster, pythonify: bool = False) -> Union[Dict, MISPGalaxyCluster]:
+        """Add a new galaxy cluster to a MISP Galaxy
+
+        :param galaxy: A MISPGalaxy (or UUID) where you wish to add the galaxy cluster
+        :param galaxy_cluster: A MISPGalaxyCluster you wish to add
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+
+        if getattr(galaxy_cluster, "default", False):
+            # We can't add default galaxies
+            raise PyMISPError('You are not able add a default galaxy cluster')
+        galaxy_id = get_uuid_or_id_from_abstract_misp(galaxy)
+        r = self._prepare_request('POST', f'galaxy_clusters/add/{galaxy_id}', data=galaxy_cluster)
+        cluster_j = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in cluster_j:
+            return cluster_j
+        gc = MISPGalaxyCluster()
+        gc.from_dict(**cluster_j)
+        return gc
+
+    def update_galaxy_cluster(self, galaxy_cluster: MISPGalaxyCluster, pythonify: bool = False) -> Union[Dict, MISPGalaxyCluster]:
+        """Update a custom galaxy cluster.
+
+        ;param galaxy_cluster: The MISPGalaxyCluster you wish to update
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+
+        if getattr(galaxy_cluster, "default", False):
+            # We can't edit default galaxies
+            raise PyMISPError('You are not able to update a default galaxy cluster')
+        cluster_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster)
+        r = self._prepare_request('POST', f'galaxy_clusters/edit/{cluster_id}', data=galaxy_cluster)
+        cluster_j = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in cluster_j:
+            return cluster_j
+        gc = MISPGalaxyCluster()
+        gc.from_dict(**cluster_j)
+        return gc
+
+    def publish_galaxy_cluster(self, galaxy_cluster: Union[MISPGalaxyCluster, int, str, UUID]) -> Dict:
+        """Publishes a galaxy cluster
+
+        :param galaxy_cluster: The galaxy cluster you wish to publish
+        """
+        if isinstance(galaxy_cluster, MISPGalaxyCluster) and getattr(galaxy_cluster, "default", False):
+            raise PyMISPError('You are not able to publish a default galaxy cluster')
+        cluster_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster)
+        r = self._prepare_request('POST', f'galaxy_clusters/publish/{cluster_id}')
+        response = self._check_json_response(r)
+        return response
+
+    def fork_galaxy_cluster(self, galaxy: Union[MISPGalaxy, int, str, UUID], galaxy_cluster: MISPGalaxyCluster, pythonify: bool = False) -> Union[Dict, MISPGalaxyCluster]:
+        """Forks an existing galaxy cluster, creating a new one with matching attributes
+
+        :param galaxy: The galaxy (or galaxy ID) where the cluster you want to fork resides
+        :param galaxy_cluster: The galaxy cluster you wish to fork
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+
+        galaxy_id = get_uuid_or_id_from_abstract_misp(galaxy)
+        cluster_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster)
+        # Create a duplicate cluster from the cluster to fork
+        forked_galaxy_cluster = MISPGalaxyCluster()
+        forked_galaxy_cluster.from_dict(**galaxy_cluster)
+        # Set the UUID and version it extends from the existing galaxy cluster
+        forked_galaxy_cluster.extends_uuid = forked_galaxy_cluster.pop('uuid')
+        forked_galaxy_cluster.extends_version = forked_galaxy_cluster.pop('version')
+        r = self._prepare_request('POST', f'galaxy_clusters/add/{galaxy_id}/forkUUID:{cluster_id}', data=galaxy_cluster)
+        cluster_j = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in cluster_j:
+            return cluster_j
+        gc = MISPGalaxyCluster()
+        gc.from_dict(**cluster_j)
+        return gc
+
+    def delete_galaxy_cluster(self, galaxy_cluster: Union[MISPGalaxyCluster, int, str, UUID], hard=False) -> Dict:
+        """Deletes a galaxy cluster from MISP
+
+        :param galaxy_cluster: The MISPGalaxyCluster you wish to delete from MISP
+        :param hard: flag for hard delete
+        """
+
+        if isinstance(galaxy_cluster, MISPGalaxyCluster) and getattr(galaxy_cluster, "default", False):
+            raise PyMISPError('You are not able to delete a default galaxy cluster')
+        data = {}
+        if hard:
+            data['hard'] = 1
+        cluster_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster)
+        r = self._prepare_request('POST', f'galaxy_clusters/delete/{cluster_id}', data=data)
+        return self._check_json_response(r)
+
+    def add_galaxy_cluster_relation(self, galaxy_cluster_relation: MISPGalaxyClusterRelation) -> Dict:
+        """Add a galaxy cluster relation, cluster relation must include
+        cluster UUIDs in both directions
+
+        :param galaxy_cluster_relation: The MISPGalaxyClusterRelation to add
+        """
+        r = self._prepare_request('POST', 'galaxy_cluster_relations/add/', data=galaxy_cluster_relation)
+        cluster_rel_j = self._check_json_response(r)
+        return cluster_rel_j
+
+    def update_galaxy_cluster_relation(self, galaxy_cluster_relation: MISPGalaxyClusterRelation) -> Dict:
+        """Update a galaxy cluster relation
+
+        :param galaxy_cluster_relation: The MISPGalaxyClusterRelation to update
+        """
+        cluster_relation_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster_relation)
+        r = self._prepare_request('POST', f'galaxy_cluster_relations/edit/{cluster_relation_id}', data=galaxy_cluster_relation)
+        cluster_rel_j = self._check_json_response(r)
+        return cluster_rel_j
+
+    def delete_galaxy_cluster_relation(self, galaxy_cluster_relation: Union[MISPGalaxyClusterRelation, int, str, UUID]) -> Dict:
+        """Delete a galaxy cluster relation
+
+        :param galaxy_cluster_relation: The MISPGalaxyClusterRelation to delete
+        """
+        cluster_relation_id = get_uuid_or_id_from_abstract_misp(galaxy_cluster_relation)
+        r = self._prepare_request('POST', f'galaxy_cluster_relations/delete/{cluster_relation_id}')
+        cluster_rel_j = self._check_json_response(r)
+        return cluster_rel_j
 
     # ## END Galaxy ###
 
@@ -1275,9 +1638,9 @@ class PyMISP:
             feed_id = get_uuid_or_id_from_abstract_misp(feed)  # In case we have a UUID
             f = MISPFeed()
             f.id = feed_id
-            f.enabled = True
         else:
             f = feed
+        f.enabled = True
         return self.update_feed(feed=f, pythonify=pythonify)
 
     def disable_feed(self, feed: Union[MISPFeed, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPFeed]:
@@ -1290,9 +1653,9 @@ class PyMISP:
             feed_id = get_uuid_or_id_from_abstract_misp(feed)  # In case we have a UUID
             f = MISPFeed()
             f.id = feed_id
-            f.enabled = False
         else:
             f = feed
+        f.enabled = False
         return self.update_feed(feed=f, pythonify=pythonify)
 
     def enable_feed_cache(self, feed: Union[MISPFeed, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPFeed]:
@@ -1305,9 +1668,9 @@ class PyMISP:
             feed_id = get_uuid_or_id_from_abstract_misp(feed)  # In case we have a UUID
             f = MISPFeed()
             f.id = feed_id
-            f.caching_enabled = True
         else:
             f = feed
+        f.caching_enabled = True
         return self.update_feed(feed=f, pythonify=pythonify)
 
     def disable_feed_cache(self, feed: Union[MISPFeed, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPFeed]:
@@ -1320,9 +1683,9 @@ class PyMISP:
             feed_id = get_uuid_or_id_from_abstract_misp(feed)  # In case we have a UUID
             f = MISPFeed()
             f.id = feed_id
-            f.caching_enabled = False
         else:
             f = feed
+        f.caching_enabled = False
         return self.update_feed(feed=f, pythonify=pythonify)
 
     def update_feed(self, feed: MISPFeed, feed_id: Optional[int] = None, pythonify: bool = False) -> Union[Dict, MISPFeed]:
@@ -1447,7 +1810,7 @@ class PyMISP:
 
     def add_server(self, server: MISPServer, pythonify: bool = False) -> Union[Dict, MISPServer]:
         """Add a server to synchronise with.
-        Note: You probably want to use ExpandedPyMISP.get_sync_config and ExpandedPyMISP.import_server instead
+        Note: You probably want to use PyMISP.get_sync_config and PyMISP.import_server instead
 
         :param server: sync server config
         :param pythonify: Returns a PyMISP Object instead of the plain json output
@@ -1962,6 +2325,7 @@ class PyMISP:
                **kwargs) -> Union[Dict, str, List[Union[MISPEvent, MISPAttribute, MISPObject]]]:
         '''Search in the MISP instance
 
+        :param controller: Controller to search on, it can be `events`, `objects`, `attributes`. The response will either be a list of events, objects, or attributes.
         :param return_format: Set the return format of the search (Currently supported: json, xml, openioc, suricata, snort - more formats are being moved to restSearch with the goal being that all searches happen through this API). Can be passed as the first parameter after restSearch or via the JSON payload.
         :param limit: Limit the number of results returned, depending on the scope (for example 10 attributes or 10 full events).
         :param page: If a limit is set, sets the page to be returned. page 3, limit 100 will return records 201->300).
@@ -1978,7 +2342,7 @@ class PyMISP:
         :param metadata: Only the metadata (event, tags, relations) is returned, attributes and proposals are omitted.
         :param uuid: Restrict the results by uuid.
         :param publish_timestamp: Restrict the results by the last publish timestamp (newer than).
-        :param timestamp: Restrict the results by the timestamp (last edit). Any event with a timestamp newer than the given timestamp will be returned. In case you are dealing with /attributes as scope, the attribute's timestamp will be used for the lookup.
+        :param timestamp: Restrict the results by the timestamp (last edit). Any event with a timestamp newer than the given timestamp will be returned. In case you are dealing with /attributes as scope, the attribute's timestamp will be used for the lookup. The input can be a timestamp or a short-hand time description (7d or 24h for example). You can also pass a list with two values to set a time range (for example ["14d", "7d"]).
         :param published: Set whether published or unpublished events should be returned. Do not set the parameter if you want both.
         :param enforce_warninglist: Remove any attributes from the result that would cause a hit on a warninglist entry.
         :param to_ids: By default all attributes are returned that match the other filter parameters, regardless of their to_ids setting. To restrict the returned data set to to_ids only attributes set this parameter to 1. 0 for the ones with to_ids set to False.
@@ -2107,7 +2471,7 @@ class PyMISP:
                 return self._csv_to_dict(normalized_response_text)  # type: ignore
             else:
                 return normalized_response_text
-        elif return_format == 'stix-xml':
+        elif return_format in ['stix-xml', 'text']:
             return self._check_response(response)
 
         normalized_response = self._check_json_response(response)
@@ -2618,7 +2982,7 @@ class PyMISP:
 
         if str(version) == '1':
             url = urljoin(self.root_url, '/events/upload_stix')
-            response = self._prepare_request('POST', url, data=to_post, output_type='xml')  # type: ignore
+            response = self._prepare_request('POST', url, data=to_post, output_type='xml', content_type='xml')  # type: ignore
         else:
             url = urljoin(self.root_url, '/events/upload_stix/2')
             response = self._prepare_request('POST', url, data=to_post)  # type: ignore
@@ -2918,12 +3282,7 @@ class PyMISP:
         :param tag: tag to add
         :param local: whether to tag locally
         """
-        if isinstance(misp_entity, AbstractMISP) and 'uuid' in misp_entity:
-            uuid = misp_entity.uuid
-        elif isinstance(misp_entity, dict) and 'uuid' in misp_entity:
-            uuid = misp_entity['uuid']
-        elif isinstance(misp_entity, str):
-            uuid = misp_entity
+        uuid = get_uuid_or_id_from_abstract_misp(misp_entity)
         if isinstance(tag, MISPTag):
             tag = tag.name
         to_post = {'uuid': uuid, 'tag': tag, 'local': local}
@@ -2936,12 +3295,7 @@ class PyMISP:
         :param misp_entity: misp_entity can be a UUID
         :param tag: tag to remove
         """
-        if isinstance(misp_entity, AbstractMISP) and 'uuid' in misp_entity:
-            uuid = misp_entity.uuid
-        elif isinstance(misp_entity, dict) and 'uuid' in misp_entity:
-            uuid = misp_entity['uuid']
-        elif isinstance(misp_entity, str):
-            uuid = misp_entity
+        uuid = get_uuid_or_id_from_abstract_misp(misp_entity)
         if isinstance(tag, MISPTag):
             if 'name' in tag:
                 tag_name = tag.name
@@ -3088,7 +3442,8 @@ class PyMISP:
         except Exception:
             logger.debug(response.text)
             if expect_json:
-                raise PyMISPUnexpectedResponse(f'Unexpected response from server: {response.text}')
+                error_msg = f'Unexpected response (size: {len(response.text)}) from server: {response.text}'
+                raise PyMISPUnexpectedResponse(error_msg)
             if lenient_response_type and not response.headers['Content-Type'].startswith('application/json'):
                 return response.text
             if not response.content:
@@ -3101,7 +3456,7 @@ class PyMISP:
         return f'<{self.__class__.__name__}(url={self.root_url})'
 
     def _prepare_request(self, request_type: str, url: str, data: Union[str, Iterable, Mapping, AbstractMISP] = {}, params: Mapping = {},
-                         kw_params: Mapping = {}, output_type: str = 'json') -> requests.Response:
+                         kw_params: Mapping = {}, output_type: str = 'json', content_type: str = 'json') -> requests.Response:
         '''Prepare a request for python-requests'''
         url = urljoin(self.root_url, url)
         if data == {} or isinstance(data, str):
@@ -3131,7 +3486,7 @@ class PyMISP:
         prepped.headers.update(
             {'Authorization': self.key,
              'Accept': f'application/{output_type}',
-             'content-type': 'application/json',
+             'content-type': f'application/{content_type}',
              'User-Agent': user_agent})
         logger.debug(prepped.headers)
         settings = self.__session.merge_environment_settings(req.url, proxies=self.proxies or {}, stream=None,

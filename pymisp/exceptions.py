@@ -19,7 +19,19 @@ class NewAttributeError(PyMISPError):
     pass
 
 
+class NewEventReportError(PyMISPError):
+    pass
+
+
 class UpdateAttributeError(PyMISPError):
+    pass
+
+
+class NewGalaxyClusterError(PyMISPError):
+    pass
+
+
+class NewGalaxyClusterRelationError(PyMISPError):
     pass
 
 
