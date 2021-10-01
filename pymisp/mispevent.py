@@ -528,8 +528,8 @@ class MISPAttribute(AbstractMISP):
 
         super().from_dict(**kwargs)
 
-    def to_dict(self) -> Dict:
-        to_return = super().to_dict()
+    def to_dict(self, json_format: bool = False) -> Dict:
+        to_return = super().to_dict(json_format)
         if self.data:
             to_return['data'] = base64.b64encode(self.data.getvalue()).decode()
         return to_return
@@ -967,10 +967,10 @@ class MISPObject(AbstractMISP):
             to_return.append(a)
         return to_return
 
-    def to_dict(self, strict: bool = False) -> Dict:
+    def to_dict(self, json_format: bool = False, strict: bool = False) -> Dict:
         if strict or self._strict and self._known_template:
             self._validate()
-        return super(MISPObject, self).to_dict()
+        return super(MISPObject, self).to_dict(json_format)
 
     def to_json(self, sort_keys: bool = False, indent: Optional[int] = None, strict: bool = False):
         if strict or self._strict and self._known_template:
@@ -1396,11 +1396,8 @@ class MISPEvent(AbstractMISP):
 
     def __init__(self, describe_types: Optional[Dict] = None, strict_validation: bool = False, **kwargs):
         super().__init__(**kwargs)
-        if strict_validation:
-            schema_file = 'schema.json'
-        else:
-            schema_file = 'schema-lax.json'
-        self.__json_schema = self._load_json(self.resources_path / schema_file)
+        self.__schema_file = 'schema.json' if strict_validation else 'schema-lax.json'
+
         if describe_types:
             # This variable is used in add_attribute in order to avoid duplicating the structure
             self.describe_types = describe_types
@@ -1618,7 +1615,8 @@ class MISPEvent(AbstractMISP):
             event.pop('Object', None)
         self.from_dict(**event)
         if validate:
-            jsonschema.validate(json.loads(self.to_json()), self.__json_schema)
+            json_schema = self._load_json(self.resources_path / self.__schema_file)
+            jsonschema.validate({"Event": self.jsonable()}, json_schema)
 
     def __setattr__(self, name, value):
         if name in ['date']:
@@ -1730,8 +1728,8 @@ class MISPEvent(AbstractMISP):
 
         super(MISPEvent, self).from_dict(**kwargs)
 
-    def to_dict(self) -> Dict:
-        to_return = super().to_dict()
+    def to_dict(self, json_format: bool = False) -> Dict:
+        to_return = super().to_dict(json_format)
 
         if to_return.get('date'):
             if isinstance(self.date, datetime):
@@ -2056,13 +2054,16 @@ class MISPWarninglist(AbstractMISP):
 
 class MISPTaxonomy(AbstractMISP):
 
-    name: str
     enabled: bool
+    namespace: str
 
     def from_dict(self, **kwargs):
         if 'Taxonomy' in kwargs:
             kwargs = kwargs['Taxonomy']
         super().from_dict(**kwargs)
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__}(namespace={self.namespace})>'
 
 
 class MISPNoticelist(AbstractMISP):

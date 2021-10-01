@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 from os import path
 
-from setuptools import setup
+from setuptools import setup  # type: ignore
 
 import pymisp
 
@@ -38,14 +38,10 @@ setup(
         'Topic :: Security',
         'Topic :: Internet',
     ],
-    install_requires=['six',
-                      'requests',
+    install_requires=['requests',
                       'python-dateutil',
                       'jsonschema',
-                      'deprecated',
-                      'RTFDE',
-                      'extract_msg',
-                      'oletools'],
+                      'deprecated'],
     extras_require={'fileobjects': ['python-magic', 'pydeep', 'lief>=0.11.0'],
                     'neo': ['py2neo'],
                     'openioc': ['beautifulsoup4'],

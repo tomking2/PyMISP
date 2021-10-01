@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import sys
-
 
 import unittest
 
@@ -43,13 +43,17 @@ try:
 except ImportError as e:
     print(e)
     url = 'https://localhost:8443'
-    key = 'd6OmdDFvU3Seau3UjwvHS1y3tFQbaRNhJhDX0tjh'
+    key = 'i8ckGjsyrfRSCPqE0qqr0XJbsLlfbOyYDzdSDawM'
     verifycert = False
 
 
 urllib3.disable_warnings()
 
 fast_mode = False
+
+if not Path('tests/viper-test-files').exists():
+    print('The test files are missing, pulling it.')
+    os.system('git clone https://github.com/viper-framework/viper-test-files.git tests/viper-test-files')
 
 
 class TestComprehensive(unittest.TestCase):
@@ -951,8 +955,9 @@ class TestComprehensive(unittest.TestCase):
             response = self.user_misp_connector.add_event(event, metadata=True)
             self.assertEqual(len(response.attributes), 0)  # response should contains zero attributes
 
-            event.info = "New name"
+            event.info = "New name ©"
             response = self.user_misp_connector.update_event(event, metadata=True)
+            self.assertEqual(response.info, event.info)
             self.assertEqual(len(response.attributes), 0)  # response should contains zero attributes
         finally:  # cleanup
             self.admin_misp_connector.delete_event(event)
@@ -1307,6 +1312,15 @@ class TestComprehensive(unittest.TestCase):
             new_object.add_attribute('filename', 'foobar.exe')
             new_object = self.admin_misp_connector.update_object(new_object, pythonify=True)
             self.assertEqual(new_object.get_attributes_by_relation('filename')[1].value, 'foobar.exe', new_object)
+
+            # Get existing custom object, modify it, update on MISP
+            existing_object = self.admin_misp_connector.get_object(new_object.uuid, pythonify=True)
+            # existing_object.force_misp_objects_path_custom('tests/mispevent_testfiles', 'overwrite_file')
+            # The existing_object is a overwrite_file object, unless we uncomment the line above, type= is required below.
+            existing_object.add_attribute('pattern-in-file', value='foo', type='text')
+            updated_existing_object = self.admin_misp_connector.update_object(existing_object, pythonify=True)
+            self.assertEqual(updated_existing_object.get_attributes_by_relation('pattern-in-file')[0].value, 'foo', updated_existing_object)
+
         finally:
             # Delete event
             self.admin_misp_connector.delete_event(first)
@@ -1317,17 +1331,30 @@ class TestComprehensive(unittest.TestCase):
                            {'MyCoolerAttribute': {'value': 'even worse', 'type': 'text', 'disable_correlation': True}}]
         misp_object = GenericObjectGenerator('my-cool-template')
         misp_object.generate_attributes(attributeAsDict)
+        misp_object.template_uuid = uuid4()
+        misp_object.template_id = 1
+        misp_object.description = 'bar'
+        setattr(misp_object, 'meta-category', 'foo')
         first.add_object(misp_object)
         blah_object = MISPObject('BLAH_TEST')
+        blah_object.template_uuid = uuid4()
+        blah_object.template_id = 1
+        blah_object.description = 'foo'
+        setattr(blah_object, 'meta-category', 'bar')
         blah_object.add_reference(misp_object.uuid, "test relation")
         blah_object.add_attribute('transaction-number', value='foo', type="text", disable_correlation=True)
         first.add_object(blah_object)
         try:
             first = self.user_misp_connector.add_event(first)
-            self.assertEqual(len(first.objects[0].attributes), 2)
+            self.assertEqual(len(first.objects[0].attributes), 2, first.objects[0].attributes)
             self.assertFalse(first.objects[0].attributes[0].disable_correlation)
             self.assertTrue(first.objects[0].attributes[1].disable_correlation)
             self.assertTrue(first.objects[1].attributes[0].disable_correlation)
+
+            # test update on totally unknown template
+            first.objects[1].add_attribute('my relation', value='foobar', type='text', disable_correlation=True)
+            updated_custom = self.user_misp_connector.update_object(first.objects[1], pythonify=True)
+            self.assertEqual(updated_custom.attributes[1].value, 'foobar', updated_custom)
         finally:
             # Delete event
             self.admin_misp_connector.delete_event(first)
@@ -1576,6 +1603,8 @@ class TestComprehensive(unittest.TestCase):
         # Get list
         taxonomies = self.admin_misp_connector.taxonomies(pythonify=True)
         self.assertTrue(isinstance(taxonomies, list))
+
+        # Test fetching taxonomy by ID
         list_name_test = 'tlp'
         for tax in taxonomies:
             if tax.namespace == list_name_test:
@@ -1583,10 +1612,17 @@ class TestComprehensive(unittest.TestCase):
         r = self.admin_misp_connector.get_taxonomy(tax, pythonify=True)
         self.assertEqual(r.namespace, list_name_test)
         self.assertTrue('enabled' in r)
+
+        # Test fetching taxonomy by namespace
+        r = self.admin_misp_connector.get_taxonomy("tlp", pythonify=True)
+        self.assertEqual(r.namespace, "tlp")
+
         r = self.admin_misp_connector.enable_taxonomy(tax)
         self.assertEqual(r['message'], 'Taxonomy enabled')
+
         r = self.admin_misp_connector.enable_taxonomy_tags(tax)
         self.assertEqual(r['name'], 'The tag(s) has been saved.')
+
         r = self.admin_misp_connector.disable_taxonomy(tax)
         self.assertEqual(r['message'], 'Taxonomy disabled')
 
@@ -1712,7 +1748,7 @@ class TestComprehensive(unittest.TestCase):
         self.assertEqual(user.email, users_email)
         # get user
         user = self.user_misp_connector.get_user(pythonify=True)
-        self.assertEqual(user.authkey, self.test_usr.authkey)
+        # self.assertEqual(user.authkey, self.test_usr.authkey)
         # Update user
         user.email = 'foo@bar.de'
         user = self.admin_misp_connector.update_user(user, pythonify=True)
@@ -2077,6 +2113,18 @@ class TestComprehensive(unittest.TestCase):
         sharing_group = self.admin_misp_connector.add_sharing_group(sg, pythonify=True)
         self.assertEqual(sharing_group.name, 'Testcases SG')
         self.assertEqual(sharing_group.releasability, 'Testing')
+
+        # Change releasability
+        r = self.admin_misp_connector.update_sharing_group({"releasability": "Testing updated"}, sharing_group, pythonify=True)
+        self.assertEqual(r.releasability, 'Testing updated')
+        r = self.admin_misp_connector.update_sharing_group({"releasability": "Testing updated - 2"}, sharing_group)
+        self.assertEqual(r['SharingGroup']['releasability'], 'Testing updated - 2')
+
+        # Test `sharing_group_exists` method
+        self.assertTrue(self.admin_misp_connector.sharing_group_exists(sharing_group))
+        self.assertTrue(self.admin_misp_connector.sharing_group_exists(sharing_group.id))
+        self.assertTrue(self.admin_misp_connector.sharing_group_exists(sharing_group.uuid))
+
         # add org
         r = self.admin_misp_connector.add_org_to_sharing_group(sharing_group,
                                                                self.test_org, extend=True)
@@ -2124,6 +2172,10 @@ class TestComprehensive(unittest.TestCase):
             # Delete sharing group
             r = self.admin_misp_connector.delete_sharing_group(sharing_group.id)
             self.assertEqual(r['message'], 'SharingGroup deleted')
+
+        self.assertFalse(self.admin_misp_connector.sharing_group_exists(sharing_group))
+        self.assertFalse(self.admin_misp_connector.sharing_group_exists(sharing_group.id))
+        self.assertFalse(self.admin_misp_connector.sharing_group_exists(sharing_group.uuid))
 
     def test_feeds(self):
         # Add
@@ -2460,7 +2512,37 @@ class TestComprehensive(unittest.TestCase):
 
     def test_upload_stix(self):
         # FIXME https://github.com/MISP/MISP/issues/4892
-        pass
+        try:
+            r1 = self.user_misp_connector.upload_stix('tests/stix1.xml-utf8', version='1')
+            print(r1.text)
+            event_stix_one = MISPEvent()
+            event_stix_one.load(r1.json())
+            # self.assertEqual(event_stix_one.attributes[0], '8.8.8.8')
+            self.admin_misp_connector.delete_event(event_stix_one)
+            bl = self.admin_misp_connector.delete_event_blocklist(event_stix_one.uuid)
+            self.assertTrue(bl['success'])
+
+            r2 = self.user_misp_connector.upload_stix('tests/stix2.json', version='2')
+            print(json.dumps(r2.json(), indent=2))
+            event_stix_two = MISPEvent()
+            event_stix_two.load(r2.json())
+            print(event_stix_two.to_json(indent=2))
+            # FIXME: the response is buggy.
+            # self.assertEqual(event_stix_two.attributes[0], '8.8.8.8')
+            self.admin_misp_connector.delete_event(event_stix_two)
+            bl = self.admin_misp_connector.delete_event_blocklist(event_stix_two.uuid)
+            self.assertTrue(bl['success'])
+        finally:
+            try:
+                self.admin_misp_connector.delete_event(event_stix_one)
+                self.admin_misp_connector.delete_event_blocklist(event_stix_one.uuid)
+            except Exception:
+                pass
+            try:
+                self.admin_misp_connector.delete_event(event_stix_two)
+                self.admin_misp_connector.delete_event_blocklist(event_stix_two.uuid)
+            except Exception:
+                pass
 
     def test_toggle_global_pythonify(self):
         first = self.create_simple_event()

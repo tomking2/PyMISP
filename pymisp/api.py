@@ -28,6 +28,15 @@ from .mispevent import MISPEvent, MISPAttribute, MISPSighting, MISPLog, MISPObje
     MISPGalaxyCluster, MISPGalaxyClusterRelation, MISPCorrelationExclusion
 from .abstract import pymisp_json_default, MISPTag, AbstractMISP, describe_types
 
+try:
+    # cached_property exists since Python 3.8
+    from functools import cached_property  # type: ignore
+except ImportError:
+    from functools import lru_cache
+
+    def cached_property(func):  # type: ignore
+        return property(lru_cache()(func))
+
 SearchType = TypeVar('SearchType', str, int)
 # str: string to search / list: values to search (OR) / dict: {'OR': [list], 'NOT': [list], 'AND': [list]}
 SearchParameterTypes = TypeVar('SearchParameterTypes', str, List[Union[str, int]], Dict[str, Union[str, int]])
@@ -79,7 +88,7 @@ def register_user(misp_url: str, email: str,
     if organisation:
         data['org_uuid'] = get_uuid_or_id_from_abstract_misp(data.pop('organisation'))
 
-    url = urljoin(data.pop('misp_url'), '/users/register')
+    url = urljoin(data.pop('misp_url'), 'users/register')
     user_agent = f'PyMISP {__version__} - no login -  Python {".".join(str(x) for x in sys.version_info[:2])}'
     headers = {
         'Accept': 'application/json',
@@ -213,12 +222,17 @@ class PyMISP:
     @property
     def recommended_pymisp_version(self) -> Dict:
         """Returns the recommended API version from the server"""
+        # Sine MISP 2.4.146 is recommended PyMISP version included in getVersion call
+        misp_version = self.misp_instance_version
+        if "pymisp_recommended_version" in misp_version:
+            return {"version": misp_version["pymisp_recommended_version"]}  # Returns dict to keep BC
+
         response = self._prepare_request('GET', 'servers/getPyMISPVersion.json')
         return self._check_json_response(response)
 
     @property
     def version(self) -> Dict:
-        """Returns the version of PyMISP you're curently using"""
+        """Returns the version of PyMISP you're currently using"""
         return {'version': __version__}
 
     @property
@@ -235,7 +249,7 @@ class PyMISP:
             return {'version': version[0]}
         return {'error': 'Impossible to retrieve the version of the main branch.'}
 
-    @property
+    @cached_property
     def misp_instance_version(self) -> Dict:
         """Returns the version of the instance."""
         response = self._prepare_request('GET', 'servers/getVersion')
@@ -1096,7 +1110,7 @@ class PyMISP:
         return to_return
 
     def get_taxonomy(self, taxonomy: Union[MISPTaxonomy, int, str, UUID], pythonify: bool = False) -> Union[Dict, MISPTaxonomy]:
-        """Get a taxonomy by id from a MISP instance
+        """Get a taxonomy by id or namespace from a MISP instance
 
         :param taxonomy: taxonomy to get
         :param pythonify: Returns a PyMISP Object instead of the plain json output
@@ -1147,9 +1161,9 @@ class PyMISP:
         t = self.get_taxonomy(taxonomy_id)
         if isinstance(t, MISPTaxonomy) and not t.enabled:
             # Can happen if global pythonify is enabled.
-            raise PyMISPError(f"The taxonomy {t.name} is not enabled.")
+            raise PyMISPError(f"The taxonomy {t.namespace} is not enabled.")
         elif not t['Taxonomy']['enabled']:
-            raise PyMISPError(f"The taxonomy {t['Taxonomy']['name']} is not enabled.")
+            raise PyMISPError(f"The taxonomy {t['Taxonomy']['namespace']} is not enabled.")
         url = urljoin(self.root_url, 'taxonomies/addTag/{}'.format(taxonomy_id))
         response = self._prepare_request('POST', url)
         return self._check_json_response(response)
@@ -1925,6 +1939,34 @@ class PyMISP:
         s.from_dict(**sharing_group_j)
         return s
 
+    def update_sharing_group(self, sharing_group: Union[MISPSharingGroup, dict], sharing_group_id: Optional[int] = None, pythonify: bool = False) -> Union[Dict, MISPSharingGroup]:
+        """Update sharing group parameters
+
+        :param sharing_group: MISP Sharing Group
+        :param sharing_group_id Sharing group ID
+        :param pythonify: Returns a PyMISP Object instead of the plain json output
+        """
+        if sharing_group_id is None:
+            sid = get_uuid_or_id_from_abstract_misp(sharing_group)
+        else:
+            sid = get_uuid_or_id_from_abstract_misp(sharing_group_id)
+        r = self._prepare_request('POST', f'sharing_groups/edit/{sid}', data=sharing_group)
+        updated_sharing_group = self._check_json_response(r)
+        if not (self.global_pythonify or pythonify) or 'errors' in updated_sharing_group:
+            return updated_sharing_group
+        s = MISPSharingGroup()
+        s.from_dict(**updated_sharing_group)
+        return s
+
+    def sharing_group_exists(self, sharing_group: Union[MISPSharingGroup, int, str, UUID]) -> bool:
+        """Fast check if sharing group exists.
+
+        :param sharing_group: Sharing group to check
+        """
+        sharing_group_id = get_uuid_or_id_from_abstract_misp(sharing_group)
+        r = self._prepare_request('HEAD', f'sharing_groups/view/{sharing_group_id}')
+        return self._check_head_response(r)
+
     def delete_sharing_group(self, sharing_group: Union[MISPSharingGroup, int, str, UUID]) -> Dict:
         """Delete a sharing group
 
@@ -2023,6 +2065,15 @@ class PyMISP:
         o = MISPOrganisation()
         o.from_dict(**organisation_j)
         return o
+
+    def organisation_exists(self, organisation: Union[MISPOrganisation, int, str, UUID]) -> bool:
+        """Fast check if organisation exists.
+
+        :param organisation: Organisation to check
+        """
+        organisation_id = get_uuid_or_id_from_abstract_misp(organisation)
+        r = self._prepare_request('HEAD', f'organisations/view/{organisation_id}')
+        return self._check_head_response(r)
 
     def add_organisation(self, organisation: MISPOrganisation, pythonify: bool = False) -> Union[Dict, MISPOrganisation]:
         """Add an organisation
@@ -2270,7 +2321,7 @@ class PyMISP:
         :param role: the default role to set
         """
         role_id = get_uuid_or_id_from_abstract_misp(role)
-        url = urljoin(self.root_url, f'/admin/roles/set_default/{role_id}')
+        url = urljoin(self.root_url, f'admin/roles/set_default/{role_id}')
         response = self._prepare_request('POST', url)
         return self._check_json_response(response)
 
@@ -2321,6 +2372,7 @@ class PyMISP:
                include_correlations: Optional[bool] = None, includeCorrelations: Optional[bool] = None,
                include_decay_score: Optional[bool] = None, includeDecayScore: Optional[bool] = None,
                object_name: Optional[str] = None,
+               exclude_decayed: Optional[bool] = None,
                pythonify: Optional[bool] = False,
                **kwargs) -> Union[Dict, str, List[Union[MISPEvent, MISPAttribute, MISPObject]]]:
         '''Search in the MISP instance
@@ -2360,6 +2412,7 @@ class PyMISP:
         :param include_decay_score: Include the decay score at attribute level.
         :param include_correlations: [JSON Only - attribute] Include the correlations of the matching attributes.
         :param object_name: [objects controller only] Search for objects with that name
+        :param exclude_decayed: [attributes controller only] Exclude the decayed attributes from the response
         :param pythonify: Returns a list of PyMISP Objects instead of the plain json output. Warning: it might use a lot of RAM
 
         Deprecated:
@@ -2459,6 +2512,7 @@ class PyMISP:
         query['includeDecayScore'] = self._make_misp_bool(include_decay_score)
         query['includeCorrelations'] = self._make_misp_bool(include_correlations)
         query['object_name'] = object_name
+        query['excludeDecayed'] = self._make_misp_bool(exclude_decayed)
         url = urljoin(self.root_url, f'{controller}/restSearch')
         if return_format == 'stix-xml':
             response = self._prepare_request('POST', url, data=query, output_type='xml')
@@ -2749,7 +2803,7 @@ class PyMISP:
 
     def search_feeds(self, value: Optional[SearchParameterTypes] = None, pythonify: Optional[bool] = False) -> Union[Dict, List[MISPFeed]]:
         '''Search in the feeds cached on the servers'''
-        response = self._prepare_request('POST', '/feeds/searchCaches', data={'value': value})
+        response = self._prepare_request('POST', 'feeds/searchCaches', data={'value': value})
         normalized_response = self._check_json_response(response)
         if not (self.global_pythonify or pythonify) or 'errors' in normalized_response:
             return normalized_response
@@ -2977,14 +3031,11 @@ class PyMISP:
         else:
             raise MISPServerError("please fill path or data parameter")
 
-        if isinstance(to_post, bytes):
-            to_post = to_post.decode()
-
         if str(version) == '1':
-            url = urljoin(self.root_url, '/events/upload_stix')
+            url = urljoin(self.root_url, 'events/upload_stix')
             response = self._prepare_request('POST', url, data=to_post, output_type='xml', content_type='xml')  # type: ignore
         else:
-            url = urljoin(self.root_url, '/events/upload_stix/2')
+            url = urljoin(self.root_url, 'events/upload_stix/2')
             response = self._prepare_request('POST', url, data=to_post)  # type: ignore
         return response
 
@@ -3333,7 +3384,7 @@ class PyMISP:
 
     def get_all_functions(self, not_implemented: bool = False):
         '''Get all methods available via the API, including ones that are not implemented.'''
-        response = self._prepare_request('GET', '/servers/queryACL/printAllFunctionNames')
+        response = self._prepare_request('GET', 'servers/queryACL/printAllFunctionNames')
         functions = self._check_json_response(response)
         # Format as URLs
         paths = []
@@ -3455,18 +3506,20 @@ class PyMISP:
     def __repr__(self):
         return f'<{self.__class__.__name__}(url={self.root_url})'
 
-    def _prepare_request(self, request_type: str, url: str, data: Union[str, Iterable, Mapping, AbstractMISP] = {}, params: Mapping = {},
+    def _prepare_request(self, request_type: str, url: str, data: Union[Iterable, Mapping, AbstractMISP, bytes] = {}, params: Mapping = {},
                          kw_params: Mapping = {}, output_type: str = 'json', content_type: str = 'json') -> requests.Response:
         '''Prepare a request for python-requests'''
+        if url[0] == '/':
+            # strip it: it will fail if MISP is in a sub directory
+            url = url[1:]
         url = urljoin(self.root_url, url)
-        if data == {} or isinstance(data, str):
+        if data == {} or isinstance(data, bytes):
             d = data
         elif data:
-            if not isinstance(data, str):  # Else, we already have a text blob to send
-                if isinstance(data, dict):  # Else, we can directly json encode.
-                    # Remove None values.
-                    data = {k: v for k, v in data.items() if v is not None}
-                d = json.dumps(data, default=pymisp_json_default)
+            if isinstance(data, dict):  # Else, we can directly json encode.
+                # Remove None values.
+                data = {k: v for k, v in data.items() if v is not None}
+            d = json.dumps(data, default=pymisp_json_default)
 
         logger.debug(f'{request_type} - {url}')
         if d is not None:

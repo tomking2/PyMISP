@@ -48,6 +48,14 @@ class TestMISPEvent(unittest.TestCase):
         del self.mispevent.uuid
         self.assertEqual(self.mispevent.to_json(sort_keys=True, indent=2), json.dumps(ref_json, sort_keys=True, indent=2))
 
+    def test_loadfile_validate(self):
+        misp_event = MISPEvent()
+        misp_event.load_file('tests/mispevent_testfiles/event.json', validate=True)
+
+    def test_loadfile_validate_strict(self):
+        misp_event = MISPEvent(strict_validation=True)
+        misp_event.load_file('tests/mispevent_testfiles/event.json', validate=True)
+
     def test_event_tag(self):
         self.init_event()
         self.mispevent.add_tag('bar')
@@ -78,6 +86,15 @@ class TestMISPEvent(unittest.TestCase):
         with open('tests/mispevent_testfiles/attribute_del.json', 'r') as f:
             ref_json = json.load(f)
         self.assertEqual(self.mispevent.to_json(sort_keys=True, indent=2), json.dumps(ref_json, sort_keys=True, indent=2))
+
+    def test_to_dict_json_format(self):
+        misp_event = MISPEvent()
+        av_signature_object = MISPObject("av-signature")
+        av_signature_object.add_attribute("signature", "EICAR")
+        av_signature_object.add_attribute("software", "ClamAv")
+        misp_event.add_object(av_signature_object)
+
+        self.assertEqual(json.loads(misp_event.to_json()), misp_event.to_dict(json_format=True))
 
     def test_object_tag(self):
         self.mispevent.add_object(name='file', strict=True)
